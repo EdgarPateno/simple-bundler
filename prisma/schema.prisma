@@ -32,3 +32,73 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
+
+
+model Bundle {
+  id              String   @id @default(cuid())
+  shop            String
+  parentProductId String
+  handle          String
+  title           String
+
+  status          String   @default("draft") // draft|active|archived
+  health          String   @default("ok")    // ok|needs_attention
+  issuesCount     Int      @default(0)
+  lastValidatedAt DateTime?
+
+  components      BundleComponent[]
+  options         BundleOption[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([shop, parentProductId])
+  @@unique([shop, handle])
+}
+
+model BundleComponent {
+  id        String @id @default(cuid())
+  bundleId  String
+  position  Int
+  productId String
+
+  bundle    Bundle @relation(fields: [bundleId], references: [id])
+
+  @@unique([bundleId, position])
+}
+
+model BundleOption {
+  id          String @id @default(cuid())
+  bundleId    String
+  kind        String // "shared" | "paired"
+  displayName String
+  values      BundleOptionValue[]
+
+  bundle      Bundle @relation(fields: [bundleId], references: [id])
+}
+
+model BundleOptionValue {
+  id           String  @id @default(cuid())
+  optionId     String
+  displayValue String
+  sortOrder    Int     @default(0)
+  enabled      Boolean @default(true)
+
+  maps         BundleValueMap[]
+
+  option       BundleOption @relation(fields: [optionId], references: [id])
+
+  @@unique([optionId, displayValue])
+}
+
+model BundleValueMap {
+  id                   String @id @default(cuid())
+  valueId              String
+  componentPos         Int
+  componentOptionName  String
+  componentOptionValue String
+
+  value                BundleOptionValue @relation(fields: [valueId], references: [id])
+
+  @@unique([valueId, componentPos, componentOptionName])
+}
