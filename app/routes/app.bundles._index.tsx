@@ -1,115 +1,163 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { useActionData, useLoaderData, useNavigate, useSubmit } from "react-router";
-import { Badge, Banner, Button, Card, Page, ResourceItem, ResourceList, Text } from "@shopify/polaris";
+import { useLoaderData, useNavigate, useFetcher } from "react-router";
+import {
+  Badge,
+  BlockStack,
+  Box,
+  Button,
+  ButtonGroup,
+  Card,
+  Divider,
+  InlineStack,
+  Layout,
+  Page,
+  Text,
+} from "@shopify/polaris";
 
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
 
-type BundleListItem = {
+type BundleRow = {
   id: string;
-  name?: string | null;
-  handle?: string | null;
-
-  // These may or may not exist in your DB depending on your schema,
-  // so we keep them optional and handle fallbacks safely.
-  bundleProductId?: string | null;        // could be GID or numeric
-  bundleProductHandle?: string | null;
-  bundleProductStatus?: string | null;
+  title: string;
+  productHandlePath: string; // e.g. /products/couple-shirt-bundle
+  status: string; // draft | active | archived | unknown
 };
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
 
-  const bundles = (await db.bundle.findMany()) as unknown as BundleListItem[];
+  const bundles = await db.bundle.findMany({
+    where: { shop: session.shop },
+    orderBy: { createdAt: "desc" },
+    select: {
+      id: true,
+      parentProductId: true,
+      handle: true,
+      title: true,
+      status: true,
+    },
+  });
 
-  return { bundles };
-};
+  // Fetch Shopify product titles/handles/status in one request
+  const ids = bundles.map((b) => b.parentProductId).filter(Boolean);
 
-export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const productsById: Record<
+    string,
+    { title: string; handle: string; status: string }
+  > = {};
 
-  const formData = await request.formData();
-  const intent = String(formData.get("_action") || "");
-
-  if (intent !== "delete") return { ok: true };
-
-  const bundleId = String(formData.get("bundleId") || "");
-  if (!bundleId) return { error: "Missing bundleId." };
-
-  // Load bundle so we can also delete the bundle product on Shopify
-  const bundle = (await db.bundle.findUnique({
-    where: { id: bundleId },
-  })) as any;
-
-  if (!bundle) return { error: "Bundle not found." };
-
-  // Best-effort: support several possible field names
-  const rawProductId: string =
-    bundle.bundleProductId ??
-    bundle.bundleProductGid ??
-    bundle.productId ??
-    "";
-
-  // Convert numeric product id -> GID if needed
-  let productGid = rawProductId;
-  if (productGid && /^\d+$/.test(productGid)) {
-    productGid = `gid://shopify/Product/${productGid}`;
-  }
-
-  // 1) Delete Shopify product (best effort)
-  if (productGid) {
+  if (ids.length) {
     const resp = await admin.graphql(
       `#graphql
-      mutation productDelete($id: ID!) {
-        productDelete(input: { id: $id }) {
-          deletedProductId
-          userErrors {
-            field
-            message
+      query ProductsById($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          ... on Product {
+            id
+            title
+            handle
+            status
           }
         }
       }`,
-      { variables: { id: productGid } },
+      { variables: { ids } },
     );
 
     const json = await resp.json();
-    const userErrors = json?.data?.productDelete?.userErrors ?? [];
 
-    if (userErrors.length) {
-      return {
-        error:
-          "Shopify product could not be deleted: " +
-          userErrors.map((e: any) => e.message).join(", "),
-      };
+    for (const node of json?.data?.nodes ?? []) {
+      if (node?.id) {
+        productsById[node.id] = {
+          title: node.title,
+          handle: node.handle,
+          status: String(node.status ?? "UNKNOWN"),
+        };
+      }
     }
   }
 
-  // 2) Delete bundle record in DB
-  await db.bundle.delete({ where: { id: bundleId } });
+  const rows: BundleRow[] = bundles.map((b) => {
+    const product = productsById[b.parentProductId];
 
-  // React Router-friendly redirect:
-  return new Response(null, {
-    status: 303,
-    headers: { Location: "/app/bundles" },
+    // Prefer Shopify product title; fallback to DB title; fallback to placeholder
+    const title = product?.title || b.title || "Untitled bundle";
+
+    // Prefer Shopify handle; fallback to DB handle; normalize to /products/<handle>
+    const rawHandle = product?.handle || b.handle || "";
+    const normalizedHandle = rawHandle.startsWith("/products/")
+      ? rawHandle.replace(/^\/products\//, "")
+      : rawHandle;
+    const productHandlePath = normalizedHandle
+      ? `/products/${normalizedHandle}`
+      : "/products/unknown";
+
+    const statusRaw = (product?.status || b.status || "UNKNOWN").toLowerCase();
+    const status =
+      statusRaw === "draft" || statusRaw === "active" || statusRaw === "archived"
+        ? statusRaw
+        : "unknown";
+
+    return {
+      id: b.id,
+      title,
+      productHandlePath,
+      status,
+    };
   });
+
+  return { bundles: rows };
 };
+
+export const action = async ({ request }: ActionFunctionArgs) => {
+  const { session } = await authenticate.admin(request);
+
+  const formData = await request.formData();
+  const intent = String(formData.get("intent") || "");
+  const id = String(formData.get("id") || "");
+
+  if (intent !== "delete" || !id) {
+    return { ok: false };
+  }
+
+  // Only delete if it belongs to this shop
+  const existing = await db.bundle.findFirst({
+    where: { id, shop: session.shop },
+    select: { id: true },
+  });
+
+  if (!existing) {
+    return { ok: false };
+  }
+
+  await db.bundle.delete({ where: { id } });
+  return { ok: true };
+};
+
+function toneForStatus(status: string) {
+  switch (status) {
+    case "active":
+      return "success";
+    case "draft":
+      return "attention";
+    case "archived":
+      return "info";
+    default:
+      return "new";
+  }
+}
 
 export default function BundlesIndex() {
   const { bundles } = useLoaderData<typeof loader>();
-  const actionData = useActionData<typeof action>() as any;
-
   const navigate = useNavigate();
-  const submit = useSubmit();
+  const fetcher = useFetcher();
 
-  const handleDelete = (bundleId: string) => {
-    const ok = confirm("Delete this bundle and its bundle product?");
+  const deletingId = fetcher.formData?.get("id")?.toString();
+
+  const handleDelete = (id: string) => {
+    const ok = window.confirm("Delete this bundle? This cannot be undone.");
     if (!ok) return;
 
-    const fd = new FormData();
-    fd.append("_action", "delete");
-    fd.append("bundleId", bundleId);
-
-    submit(fd, { method: "post" });
+    fetcher.submit({ intent: "delete", id }, { method: "post" });
   };
 
   return (
@@ -120,73 +168,61 @@ export default function BundlesIndex() {
         onAction: () => navigate("/app/bundles/new"),
       }}
     >
-      {actionData?.error ? (
-        <Banner title="Could not delete bundle" tone="critical">
-          <p>{actionData.error}</p>
-        </Banner>
-      ) : null}
+      <Layout>
+        <Layout.Section>
+          <Card>
+            {bundles.length === 0 ? (
+              <Box padding="400">
+                <Text as="p" tone="subdued">
+                  No bundles yet. Click “Create bundle” to make your first 2-product
+                  bundle.
+                </Text>
+              </Box>
+            ) : (
+              <BlockStack gap="0">
+                {bundles.map((b, idx) => (
+                  <Box key={b.id}>
+                    {idx > 0 ? <Divider /> : null}
 
-      <Card padding="0">
-        <ResourceList
-          resourceName={{ singular: "bundle", plural: "bundles" }}
-          items={bundles ?? []}
-          renderItem={(bundle) => {
-            const id = bundle.id;
+                    <Box padding="400">
+                      <InlineStack align="space-between" blockAlign="center">
+                        <BlockStack gap="100">
+                          <InlineStack gap="200" blockAlign="center">
+                            <Text as="h2" variant="headingMd">
+                              {b.title}
+                            </Text>
+                            <Badge tone={toneForStatus(b.status)}>{b.status}</Badge>
+                          </InlineStack>
 
-            const name = bundle.name ?? "Untitled bundle";
-            const handle = bundle.handle ? `/products/${bundle.handle}` : "";
-            const status = (bundle.bundleProductStatus ?? "draft") as string;
+                          <Text as="p" tone="subdued">
+                            {b.productHandlePath} • {b.status}
+                          </Text>
+                        </BlockStack>
 
-            return (
-              <ResourceItem
-                id={id}
-                accessibilityLabel={`Bundle ${name}`}
-                // keep row click-to-open if you like
-                onClick={() => navigate(`/app/bundles/${id}`)}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    gap: "16px",
-                    width: "100%",
-                  }}
-                >
-                  <div>
-                    <Text as="h3" variant="bodyMd" fontWeight="semibold">
-                      {name}
-                    </Text>
+                        <ButtonGroup>
+                          <Button
+                            tone="critical"
+                            loading={
+                              fetcher.state !== "idle" && deletingId === b.id
+                            }
+                            onClick={() => handleDelete(b.id)}
+                          >
+                            Delete
+                          </Button>
 
-                    <Text as="p" tone="subdued">
-                      {handle ? `/products/${handle}` : ""}{" "}
-                      {status ? `• ${status}` : ""}
-                    </Text>
-                  </div>
-
-                  {/* ALWAYS VISIBLE ACTIONS */}
-                  <div style={{ display: "flex", gap: "8px" }} onClick={(e) => e.stopPropagation()}>
-                    <Button
-                      tone="critical"
-                      onClick={() => handleDelete(id)}
-                    >
-                      Delete
-                    </Button>
-
-                    <Button
-                      variant="secondary"
-                      onClick={() => navigate(`/app/bundles/${id}`)}
-                    >
-                      Open
-                    </Button>
-                  </div>
-                </div>
-              </ResourceItem>
-
-            );
-          }}
-        />
-      </Card>
+                          <Button onClick={() => navigate(`/app/bundles/${b.id}`)}>
+                            Open
+                          </Button>
+                        </ButtonGroup>
+                      </InlineStack>
+                    </Box>
+                  </Box>
+                ))}
+              </BlockStack>
+            )}
+          </Card>
+        </Layout.Section>
+      </Layout>
     </Page>
   );
 }
