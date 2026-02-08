@@ -5,9 +5,6 @@ generator client {
   provider = "prisma-client-js"
 }
 
-// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
-// enough when changing adapters.
-// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
   provider = "sqlite"
   url      = "file:dev.sqlite"
@@ -32,7 +29,6 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
-
 
 model Bundle {
   id              String   @id @default(cuid())
@@ -62,7 +58,7 @@ model BundleComponent {
   position  Int
   productId String
 
-  bundle    Bundle @relation(fields: [bundleId], references: [id])
+  bundle    Bundle @relation(fields: [bundleId], references: [id], onDelete: Cascade)
 
   @@unique([bundleId, position])
 }
@@ -72,9 +68,10 @@ model BundleOption {
   bundleId    String
   kind        String // "shared" | "paired"
   displayName String
+
   values      BundleOptionValue[]
 
-  bundle      Bundle @relation(fields: [bundleId], references: [id])
+  bundle      Bundle @relation(fields: [bundleId], references: [id], onDelete: Cascade)
 }
 
 model BundleOptionValue {
@@ -86,7 +83,7 @@ model BundleOptionValue {
 
   maps         BundleValueMap[]
 
-  option       BundleOption @relation(fields: [optionId], references: [id])
+  option       BundleOption @relation(fields: [optionId], references: [id], onDelete: Cascade)
 
   @@unique([optionId, displayValue])
 }
@@ -98,7 +95,7 @@ model BundleValueMap {
   componentOptionName  String
   componentOptionValue String
 
-  value                BundleOptionValue @relation(fields: [valueId], references: [id])
+  value                BundleOptionValue @relation(fields: [valueId], references: [id], onDelete: Cascade)
 
   @@unique([valueId, componentPos, componentOptionName])
 }
