@@ -1,4 +1,4 @@
-query RunInput {
+query Input {
   cart {
     lines {
       id
@@ -7,13 +7,7 @@ query RunInput {
         __typename
         ... on ProductVariant {
           id
-          title
-          componentReference: metafield(
-            namespace: "custom"
-            key: "component_reference"
-          ) {
-            value
-          }
+          metafield(namespace: "simple_bundler", key: "components") { value }
         }
       }
     }
