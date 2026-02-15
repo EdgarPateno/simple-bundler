@@ -18,7 +18,7 @@ export function cartTransformRun(input: Input): CartTransformRunResult {
         cartLineId: line.id,
         expandedCartItems: componentVariantIds.slice(0, 2).map((merchandiseId) => ({
           merchandiseId,
-          quantity: line.quantity,
+          quantity: 1,
         })),
       },
     });
