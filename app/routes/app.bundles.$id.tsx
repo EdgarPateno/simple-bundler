@@ -6,18 +6,23 @@ import {
   useNavigation,
   useNavigate,
 } from "react-router";
+import { useMemo, useState } from "react";
 import {
   Badge,
   Banner,
   BlockStack,
   Box,
   Button,
+  ButtonGroup,
   Card,
   Divider,
+  FormLayout,
   InlineStack,
   Layout,
   Page,
+  Select,
   Text,
+  TextField,
 } from "@shopify/polaris";
 
 import db from "../db.server";
@@ -35,6 +40,21 @@ const PRODUCTS_BY_ID = `#graphql
         title
         handle
         status
+      }
+    }
+  }
+`;
+
+const PRODUCTS_LIST = `#graphql
+  query ProductsList {
+    products(first: 50) {
+      edges {
+        node {
+          id
+          title
+          handle
+          status
+        }
       }
     }
   }
@@ -63,6 +83,17 @@ const SET_COMPONENTS_METAFIELDS = `#graphql
   }
 `;
 
+const PRODUCT_UPDATE = `#graphql
+  mutation ProductUpdate($input: ProductInput!) {
+    productUpdate(input: $input) {
+      product { id title handle }
+      userErrors { field message }
+    }
+  }
+`;
+
+type ProductItem = { id: string; title: string; handle: string; status: string };
+
 type VariantNode = {
   id: string;
   selectedOptions: Array<{ name: string; value: string }>;
@@ -71,7 +102,9 @@ type VariantNode = {
 function norm(s: string) {
   return (s || "")
     .toLowerCase()
+    .replace(/[\u200B-\u200D\uFEFF]/g, "") // zero-width
     .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
@@ -83,8 +116,6 @@ function valuesBlob(v: VariantNode) {
 function matchesByValues(bundleVar: VariantNode, componentVar: VariantNode) {
   const b = valuesBlob(bundleVar);
   const cVals = (componentVar.selectedOptions ?? []).map((o) => norm(o.value));
-  // All component values must be "contained" somewhere in the bundle values blob
-  // Example: bundle "obsidian black" contains component "black"
   return cVals.every((cv) => b.includes(cv));
 }
 
@@ -121,14 +152,13 @@ async function syncComponentsMetafields(args: {
     const c1 = comp1Variants.find((v) => matchesByValues(bv, v))?.id;
     const c2 = comp2Variants.find((v) => matchesByValues(bv, v))?.id;
 
-    // Safer: if we can't match, don't write a wrong mapping
     if (!c1 || !c2) {
       missing.push(valuesBlob(bv) || bv.id);
       continue;
     }
 
     metafields.push({
-      ownerId: bv.id, // metafield lives on the BUNDLE VARIANT
+      ownerId: bv.id,
       namespace: "simple_bundler",
       key: "components",
       type: "json",
@@ -169,13 +199,24 @@ type LoaderData = {
     productHandlePath: string;
     status: string;
     parentProductId: string;
-    components: Array<{ position: number; productId: string; title: string; handle: string; status: string }>;
+    components: Array<{
+      position: number;
+      productId: string;
+      title: string;
+      handle: string;
+      status: string;
+    }>;
   };
+  products: ProductItem[];
 };
 
 type ActionData =
   | { ok: true; message: string }
-  | { ok: false; error: string }
+  | {
+      ok: false;
+      error: string;
+      fields?: { title?: string; productA?: string; productB?: string };
+    }
   | undefined;
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
@@ -201,12 +242,23 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
   if (!bundle) throw new Response("Bundle not found", { status: 404 });
 
+  // Load product list for Selects
+  const productsResp = await admin.graphql(PRODUCTS_LIST);
+  const productsJson = await productsResp.json();
+  const products: ProductItem[] =
+    productsJson?.data?.products?.edges?.map((e: any) => ({
+      id: e.node.id,
+      title: e.node.title,
+      handle: e.node.handle,
+      status: String(e.node.status ?? "UNKNOWN").toLowerCase(),
+    })) ?? [];
+
+  // Pull Shopify titles/handles/status for parent + components for nice UI
   const productIds = [
     bundle.parentProductId,
     ...bundle.components.map((c) => c.productId),
   ].filter(Boolean);
 
-  // Pull Shopify titles/handles/status for nicer UI
   const productsById: Record<string, { title: string; handle: string; status: string }> = {};
 
   if (productIds.length) {
@@ -251,6 +303,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       parentProductId: bundle.parentProductId,
       components,
     },
+    products,
   } satisfies LoaderData;
 }
 
@@ -263,8 +316,6 @@ export async function action({ request, params }: ActionFunctionArgs) {
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "");
 
-  if (intent !== "sync") return { ok: false, error: "Unknown action." } satisfies ActionData;
-
   const bundle = await db.bundle.findFirst({
     where: { id, shop: session.shop },
     select: {
@@ -275,30 +326,107 @@ export async function action({ request, params }: ActionFunctionArgs) {
   });
 
   if (!bundle) return { ok: false, error: "Bundle not found." } satisfies ActionData;
-  if (bundle.components.length < 2) {
-    return { ok: false, error: "Bundle must have 2 component products to sync." } satisfies ActionData;
+
+  if (intent === "sync") {
+    if (bundle.components.length < 2) {
+      return {
+        ok: false,
+        error: "Bundle must have 2 component products to sync.",
+      } satisfies ActionData;
+    }
+
+    const productA = bundle.components[0].productId;
+    const productB = bundle.components[1].productId;
+
+    const result = await syncComponentsMetafields({
+      admin,
+      bundleProductId: bundle.parentProductId,
+      componentProductIds: [productA, productB],
+    });
+
+    if (!result.ok) {
+      return { ok: false, error: result.error } satisfies ActionData;
+    }
+
+    await db.bundle.update({
+      where: { id: bundle.id },
+      data: { lastValidatedAt: new Date() },
+    });
+
+    return { ok: true, message: "Synced components successfully." } satisfies ActionData;
   }
 
-  const productA = bundle.components[0].productId;
-  const productB = bundle.components[1].productId;
+  if (intent === "save") {
+    const title = String(formData.get("title") || "").trim();
+    const productA = String(formData.get("productA") || "");
+    const productB = String(formData.get("productB") || "");
 
-  const result = await syncComponentsMetafields({
-    admin,
-    bundleProductId: bundle.parentProductId,
-    componentProductIds: [productA, productB],
-  });
+    if (!title || !productA || !productB) {
+      return {
+        ok: false,
+        error: "Please enter a bundle name and choose 2 products.",
+        fields: { title, productA, productB },
+      } satisfies ActionData;
+    }
 
-  if (!result.ok) {
-    return { ok: false, error: result.error } satisfies ActionData;
+    if (productA === productB) {
+      return {
+        ok: false,
+        error: "Please choose two different products.",
+        fields: { title, productA, productB },
+      } satisfies ActionData;
+    }
+
+    // 1) Update Shopify parent product title
+    const updResp = await admin.graphql(PRODUCT_UPDATE, {
+      variables: { input: { id: bundle.parentProductId, title } },
+    });
+    const updJson = await updResp.json();
+    const updErrors = updJson?.data?.productUpdate?.userErrors ?? [];
+    if (updErrors.length) {
+      return {
+        ok: false,
+        error: updErrors[0]?.message || "Failed to update Shopify product title.",
+        fields: { title, productA, productB },
+      } satisfies ActionData;
+    }
+
+    // 2) Update DB bundle title + components
+    await db.bundle.update({
+      where: { id: bundle.id },
+      data: {
+        title,
+        components: {
+          deleteMany: {}, // wipe existing positions then re-create
+          create: [
+            { position: 1, productId: productA },
+            { position: 2, productId: productB },
+          ],
+        },
+        lastValidatedAt: new Date(),
+      },
+    });
+
+    // 3) Re-sync metafields so checkout expands using NEW components
+    const syncRes = await syncComponentsMetafields({
+      admin,
+      bundleProductId: bundle.parentProductId,
+      componentProductIds: [productA, productB],
+    });
+
+    if (!syncRes.ok) {
+      return {
+        ok: false,
+        error:
+          "Saved changes, but sync failed: " + (syncRes.error || "Unknown error"),
+        fields: { title, productA, productB },
+      } satisfies ActionData;
+    }
+
+    return { ok: true, message: "Bundle updated and synced successfully." } satisfies ActionData;
   }
 
-  // Optional: mark last validated in DB
-  await db.bundle.update({
-    where: { id: bundle.id },
-    data: { lastValidatedAt: new Date() },
-  });
-
-  return { ok: true, message: "Synced components successfully." } satisfies ActionData;
+  return { ok: false, error: "Unknown action." } satisfies ActionData;
 }
 
 /* --------------------------
@@ -319,12 +447,33 @@ function badgeTone(status: string) {
 }
 
 export default function BundleDetails() {
-  const { bundle } = useLoaderData() as LoaderData;
+  const { bundle, products } = useLoaderData() as LoaderData;
   const actionData = useActionData() as ActionData;
   const nav = useNavigation();
   const navigate = useNavigate();
 
-  const syncing = nav.state !== "idle";
+  const busy = nav.state !== "idle";
+
+  const initialA = bundle.components?.[0]?.productId ?? "";
+  const initialB = bundle.components?.[1]?.productId ?? "";
+
+  const [title, setTitle] = useState(
+    actionData?.ok === false ? actionData.fields?.title ?? bundle.title : bundle.title,
+  );
+  const [productA, setProductA] = useState(
+    actionData?.ok === false ? actionData.fields?.productA ?? initialA : initialA,
+  );
+  const [productB, setProductB] = useState(
+    actionData?.ok === false ? actionData.fields?.productB ?? initialB : initialB,
+  );
+
+  const options = useMemo(
+    () => [
+      { label: "Select a product...", value: "" },
+      ...products.map((p) => ({ label: p.title, value: p.id })),
+    ],
+    [products],
+  );
 
   return (
     <Page
@@ -332,9 +481,8 @@ export default function BundleDetails() {
       backAction={{ content: "Bundles", onAction: () => navigate("/app/bundles") }}
       primaryAction={{
         content: "Sync components",
-        loading: syncing,
+        loading: busy,
         onAction: () => {
-          // Submit the sync action without needing a visible form button
           const form = document.getElementById("sync-form") as HTMLFormElement | null;
           form?.requestSubmit();
         },
@@ -348,11 +496,12 @@ export default function BundleDetails() {
                 <p>{actionData.message}</p>
               </Banner>
             ) : actionData?.ok === false ? (
-              <Banner tone="critical" title="Sync failed">
+              <Banner tone="critical" title="Action failed">
                 <p>{actionData.error}</p>
               </Banner>
             ) : null}
 
+            {/* Summary */}
             <Card>
               <Box padding="400">
                 <InlineStack align="space-between" blockAlign="center">
@@ -371,7 +520,7 @@ export default function BundleDetails() {
 
                   <Form method="post" id="sync-form">
                     <input type="hidden" name="intent" value="sync" />
-                    <Button submit loading={syncing}>
+                    <Button submit loading={busy}>
                       Sync components
                     </Button>
                   </Form>
@@ -379,6 +528,62 @@ export default function BundleDetails() {
               </Box>
             </Card>
 
+            {/* Edit form */}
+            <Card>
+              <Box padding="400">
+                <Text as="h3" variant="headingMd">
+                  Edit bundle
+                </Text>
+              </Box>
+
+              <Divider />
+
+              <Box padding="400">
+                <Form method="post">
+                  <input type="hidden" name="intent" value="save" />
+
+                  <BlockStack gap="400">
+                    <FormLayout>
+                      <TextField
+                        label="Bundle name"
+                        name="title"
+                        value={title}
+                        onChange={setTitle}
+                        autoComplete="off"
+                      />
+
+                      <Select
+                        label="Component product 1"
+                        name="productA"
+                        options={options}
+                        value={productA}
+                        onChange={setProductA}
+                      />
+
+                      <Select
+                        label="Component product 2"
+                        name="productB"
+                        options={options}
+                        value={productB}
+                        onChange={setProductB}
+                      />
+                    </FormLayout>
+
+                    <InlineStack align="end" gap="200">
+                      <Button onClick={() => navigate("/app/bundles")} disabled={busy}>
+                        Back
+                      </Button>
+
+                      <Button submit variant="primary" loading={busy}>
+                        Save changes
+                      </Button>
+                    </InlineStack>
+                  </BlockStack>
+                </Form>
+              </Box>
+            </Card>
+
+            {/* Components list */}
             <Card>
               <Box padding="400">
                 <Text as="h3" variant="headingMd">
@@ -404,7 +609,6 @@ export default function BundleDetails() {
                       <Button
                         variant="secondary"
                         onClick={() => {
-                          // Opens product page in storefront (simple + safe)
                           if (c.handle) window.open(`/products/${c.handle}`, "_blank");
                         }}
                         disabled={!c.handle}
@@ -420,7 +624,7 @@ export default function BundleDetails() {
             <Card>
               <Box padding="400">
                 <Text as="p" tone="subdued">
-                  Tip: If you rename bundle option labels/values (e.g. “Pick Your Color: Obsidian Black”), Shopify may rebuild variants.
+                  Tip: If you rename bundle option labels/values, Shopify may rebuild variants.
                   Click <strong>Sync components</strong> to re-attach mappings automatically.
                 </Text>
               </Box>
