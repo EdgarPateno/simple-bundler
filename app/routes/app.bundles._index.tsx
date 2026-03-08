@@ -60,29 +60,6 @@ const PRODUCT_DELETE = `#graphql
   }
 `;
 
-const GET_PRODUCT_VARIANTS = `#graphql
-  query GetProductVariants($id: ID!) {
-    product(id: $id) {
-      id
-      variants(first: 100) {
-        nodes {
-          id
-          selectedOptions { name value }
-        }
-      }
-    }
-  }
-`;
-
-const SET_COMPONENTS_METAFIELDS = `#graphql
-  mutation SetComponentsMetafields($metafields: [MetafieldsSetInput!]!) {
-    metafieldsSet(metafields: $metafields) {
-      userErrors { field message }
-      metafields { id namespace key }
-    }
-  }
-`;
-
 /* --------------------------
    Types
 -------------------------- */
@@ -103,98 +80,6 @@ type ActionData =
   | undefined;
 
 /* --------------------------
-   Mapping helpers (same logic as /app/bundles/:id Sync)
--------------------------- */
-
-type VariantNode = {
-  id: string;
-  selectedOptions: Array<{ name: string; value: string }>;
-};
-
-function norm(s: string) {
-  return (s || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
-// match by VALUES only (tolerant to label changes)
-function valuesBlob(v: VariantNode) {
-  return norm((v.selectedOptions ?? []).map((o) => o.value).join(" "));
-}
-
-function matchesByValues(bundleVar: VariantNode, componentVar: VariantNode) {
-  const b = valuesBlob(bundleVar);
-  const cVals = (componentVar.selectedOptions ?? []).map((o) => norm(o.value));
-  return cVals.every((cv) => b.includes(cv));
-}
-
-async function fetchVariants(admin: any, productId: string): Promise<VariantNode[]> {
-  const resp = await admin.graphql(GET_PRODUCT_VARIANTS, { variables: { id: productId } });
-  const json = await resp.json();
-  return (json?.data?.product?.variants?.nodes ?? []) as VariantNode[];
-}
-
-async function syncComponentsMetafields(args: {
-  admin: any;
-  bundleProductId: string;
-  componentProductIds: [string, string];
-}) {
-  const { admin, bundleProductId, componentProductIds } = args;
-
-  const [bundleVariants, comp1Variants, comp2Variants] = await Promise.all([
-    fetchVariants(admin, bundleProductId),
-    fetchVariants(admin, componentProductIds[0]),
-    fetchVariants(admin, componentProductIds[1]),
-  ]);
-
-  if (!bundleVariants.length) return { ok: false as const, error: "Bundle product has no variants." };
-  if (!comp1Variants.length || !comp2Variants.length) {
-    return { ok: false as const, error: "One of the component products has no variants." };
-  }
-
-  const metafields: any[] = [];
-  const missing: string[] = [];
-
-  for (const bv of bundleVariants) {
-    const c1 = comp1Variants.find((v) => matchesByValues(bv, v))?.id;
-    const c2 = comp2Variants.find((v) => matchesByValues(bv, v))?.id;
-
-    if (!c1 || !c2) {
-      missing.push(valuesBlob(bv) || bv.id);
-      continue;
-    }
-
-    metafields.push({
-      ownerId: bv.id,
-      namespace: "simple_bundler",
-      key: "components",
-      type: "json",
-      value: JSON.stringify([c1, c2]),
-    });
-  }
-
-  if (missing.length) {
-    return {
-      ok: false as const,
-      error: "Could not map these bundle variant values to component variants: " + missing.join(", "),
-    };
-  }
-
-  const setResp = await admin.graphql(SET_COMPONENTS_METAFIELDS, {
-    variables: { metafields },
-  });
-  const setJson = await setResp.json();
-  const userErrors = setJson?.data?.metafieldsSet?.userErrors ?? [];
-
-  if (userErrors.length) {
-    return { ok: false as const, error: userErrors.map((e: any) => e.message).join(", ") };
-  }
-
-  return { ok: true as const };
-}
-
-/* --------------------------
    Loader
 -------------------------- */
 
@@ -210,10 +95,6 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<LoaderDat
       handle: true,
       title: true,
       status: true,
-      components: {
-        orderBy: { position: "asc" },
-        select: { productId: true },
-      },
     },
   });
 
@@ -279,7 +160,7 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<LoaderDat
 };
 
 /* --------------------------
-   Action (Delete + Sync)
+   Action (Delete only)
 -------------------------- */
 
 export const action = async ({ request }: ActionFunctionArgs): Promise<ActionData> => {
@@ -289,80 +170,40 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<ActionDat
   const intent = String(formData.get("intent") || "");
   const id = String(formData.get("id") || "");
 
-  if (!intent || !id) return { ok: false, error: "Invalid request." };
+  if (intent !== "delete" || !id) return { ok: false, error: "Invalid request." };
 
   const existing = await db.bundle.findFirst({
     where: { id, shop: session.shop },
-    select: {
-      id: true,
-      parentProductId: true,
-      components: { orderBy: { position: "asc" }, select: { productId: true } },
-    },
+    select: { id: true, parentProductId: true },
   });
 
   if (!existing) return { ok: false, error: "Bundle not found." };
 
-  // -----------------
-  // DELETE
-  // -----------------
-  if (intent === "delete") {
-    // Try deleting Shopify product; if already deleted, still delete DB row.
-    try {
-      const delResp = await admin.graphql(PRODUCT_DELETE, {
-        variables: { input: { id: existing.parentProductId } },
-      });
-      const delJson = await delResp.json();
-      const userErrors = delJson?.data?.productDelete?.userErrors ?? [];
+  // Try deleting Shopify product; if already deleted, still delete DB row.
+  try {
+    const delResp = await admin.graphql(PRODUCT_DELETE, {
+      variables: { input: { id: existing.parentProductId } },
+    });
+    const delJson = await delResp.json();
+    const userErrors = delJson?.data?.productDelete?.userErrors ?? [];
 
-      // Only block DB delete if Shopify explicitly returns a real error
-      // (If product doesn't exist anymore, Shopify can error; we still want DB cleanup.)
-      if (userErrors.length) {
-        const msg = String(userErrors[0]?.message || "");
-        const looksLikeMissing =
-          msg.toLowerCase().includes("does not exist") ||
-          msg.toLowerCase().includes("could not find") ||
-          msg.toLowerCase().includes("not found");
+    if (userErrors.length) {
+      const msg = String(userErrors[0]?.message || "");
+      const looksLikeMissing =
+        msg.toLowerCase().includes("does not exist") ||
+        msg.toLowerCase().includes("could not find") ||
+        msg.toLowerCase().includes("not found");
 
-        if (!looksLikeMissing) {
-          return { ok: false, error: msg || "Failed to delete Shopify product." };
-        }
+      if (!looksLikeMissing) {
+        return { ok: false, error: msg || "Failed to delete Shopify product." };
       }
-    } catch {
-      // ignore and still delete DB
     }
-
-    await db.bundle.delete({ where: { id: existing.id } });
-    return { ok: true, message: "Bundle deleted." };
+  } catch {
+    // ignore and still delete DB
   }
 
-  // -----------------
-  // SYNC
-  // -----------------
-  if (intent === "sync") {
-    if (existing.components.length < 2) {
-      return { ok: false, error: "Bundle must have 2 component products to sync." };
-    }
-
-    const productA = existing.components[0].productId;
-    const productB = existing.components[1].productId;
-
-    const result = await syncComponentsMetafields({
-      admin,
-      bundleProductId: existing.parentProductId,
-      componentProductIds: [productA, productB],
-    });
-
-    if (!result.ok) return { ok: false, error: result.error };
-
-    await db.bundle.update({
-      where: { id: existing.id },
-      data: { lastValidatedAt: new Date() },
-    });
-
-    return { ok: true, message: "Synced components successfully." };
-  }
-
-  return { ok: false, error: "Unknown action." };
+  await db.bundle.delete({ where: { id: existing.id } });
+  return { ok: true, message: "Bundle deleted." };
 };
 
 /* --------------------------
@@ -391,8 +232,7 @@ export default function BundlesIndex() {
   const navigate = useNavigate();
   const fetcher = useFetcher<ActionData>();
 
-  const busyId = fetcher.formData?.get("id")?.toString();
-  const busyIntent = fetcher.formData?.get("intent")?.toString();
+  const deletingId = fetcher.formData?.get("id")?.toString();
 
   const submitDelete = (id: string) => {
     const ok = window.confirm(
@@ -400,10 +240,6 @@ export default function BundlesIndex() {
     );
     if (!ok) return;
     fetcher.submit({ intent: "delete", id }, { method: "post" });
-  };
-
-  const submitSync = (id: string) => {
-    fetcher.submit({ intent: "sync", id }, { method: "post" });
   };
 
   return (
@@ -463,23 +299,8 @@ export default function BundlesIndex() {
 
                         <ButtonGroup>
                           <Button
-                            loading={
-                              fetcher.state !== "idle" &&
-                              busyId === b.id &&
-                              busyIntent === "sync"
-                            }
-                            onClick={() => submitSync(b.id)}
-                          >
-                            Sync
-                          </Button>
-
-                          <Button
                             tone="critical"
-                            loading={
-                              fetcher.state !== "idle" &&
-                              busyId === b.id &&
-                              busyIntent === "delete"
-                            }
+                            loading={fetcher.state !== "idle" && deletingId === b.id}
                             onClick={() => submitDelete(b.id)}
                           >
                             Delete
@@ -501,4 +322,3 @@ export default function BundlesIndex() {
     </Page>
   );
 }
-
