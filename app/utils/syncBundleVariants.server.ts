@@ -5,21 +5,155 @@ const normalize = (s: string) => String(s || "").trim().toLowerCase();
 const isDefaultOnlyProduct = (variants: any[]) =>
   variants.length === 1 && normalize(variants[0]?.title) === "default title";
 
+function optionPrefix(productTitle: string) {
+  return `${String(productTitle || "").trim()} - `;
+}
+
+/* --------------------------
+   GraphQL helpers
+-------------------------- */
+
+async function gql(admin: any, query: string, variables?: any) {
+  const resp = await admin.graphql(query, variables ? { variables } : undefined);
+  return resp.json();
+}
+
+const PRODUCT_OPTIONS_CREATE = `#graphql
+  mutation CreateOptions($productId: ID!, $options: [OptionCreateInput!]!) {
+    productOptionsCreate(
+      productId: $productId
+      options: $options
+      variantStrategy: LEAVE_AS_IS
+    ) {
+      userErrors { field message }
+    }
+  }
+`;
+
+const PRODUCT_VARIANTS_BULK_CREATE = `#graphql
+  mutation CreateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+    productVariantsBulkCreate(productId: $productId, variants: $variants) {
+      userErrors { field message }
+    }
+  }
+`;
+
+const PRODUCT_VARIANTS_BULK_DELETE = `#graphql
+  mutation ProductVariantsBulkDelete($productId: ID!, $variantsIds: [ID!]!) {
+    productVariantsBulkDelete(productId: $productId, variantsIds: $variantsIds) {
+      userErrors { field message }
+    }
+  }
+`;
+
+const METAFIELDS_SET = `#graphql
+  mutation SetMetafield($metafields: [MetafieldsSetInput!]!) {
+    metafieldsSet(metafields: $metafields) {
+      userErrors { field message }
+    }
+  }
+`;
+
+/* --------------------------
+   Small utilities
+-------------------------- */
+
+function cartesian<T>(arrays: T[][]): T[][] {
+  return arrays.reduce<T[][]>(
+    (acc, curr) => acc.flatMap((a) => curr.map((b) => [...a, b])),
+    [[]],
+  );
+}
+
+function gidVariant(id: string) {
+  return typeof id === "string" && id.startsWith("gid://shopify/ProductVariant/");
+}
+
+function variantMatchesOptions(variant: any, wanted: Record<string, string>) {
+  const opts: Array<{ name: string; value: string }> = variant?.selectedOptions ?? [];
+  const map = new Map(opts.map((o) => [normalize(o.name), normalize(o.value)]));
+  for (const [k, v] of Object.entries(wanted)) {
+    if (map.get(normalize(k)) !== normalize(v)) return false;
+  }
+  return true;
+}
+
+function optionsKeyFromSelectedOptions(selectedOptions: Array<{ name: string; value: string }>) {
+  return (selectedOptions ?? [])
+    .map((o) => `${normalize(o.name)}=${normalize(o.value)}`)
+    .sort()
+    .join("|");
+}
+
+function hasRealOption(options: any[], desiredName: string) {
+  return (options ?? []).some((o) => normalize(o.name) === normalize(desiredName));
+}
+
+async function deleteVariant(admin: any, productId: string, variantId: string) {
+  const json = await gql(admin, PRODUCT_VARIANTS_BULK_DELETE, {
+    productId,
+    variantsIds: [variantId],
+  });
+  const errs = json?.data?.productVariantsBulkDelete?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0]?.message || "Failed to delete variant.");
+}
+
+async function createOptions(admin: any, productId: string, options: any[]) {
+  const json = await gql(admin, PRODUCT_OPTIONS_CREATE, { productId, options });
+  const errs = json?.data?.productOptionsCreate?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0]?.message || "Failed to create options.");
+}
+
+async function createVariants(admin: any, productId: string, variants: any[]) {
+  const json = await gql(admin, PRODUCT_VARIANTS_BULK_CREATE, { productId, variants });
+  const errs = json?.data?.productVariantsBulkCreate?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0]?.message || "Failed to create variants.");
+}
+
+async function writeBundleMetafield({
+  admin,
+  variantId,
+  componentVariantIds,
+}: {
+  admin: any;
+  variantId: string;
+  componentVariantIds: string[];
+}) {
+  if (!componentVariantIds.every(gidVariant)) return;
+
+  const json = await gql(admin, METAFIELDS_SET, {
+    metafields: [
+      {
+        ownerId: variantId,
+        namespace: "simple_bundler",
+        key: "components",
+        type: "json",
+        value: JSON.stringify(componentVariantIds),
+      },
+    ],
+  });
+
+  const errs = json?.data?.metafieldsSet?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0]?.message || "Failed to set metafields.");
+}
+
+/* --------------------------
+   Main function
+-------------------------- */
+
 export async function syncBundleVariants({
   admin,
   bundleProductId,
   componentProductAId,
   componentProductBId,
+  variantMode = "shared",
 }: {
   admin: AdminClient;
   bundleProductId: string;
   componentProductAId: string;
   componentProductBId: string;
+  variantMode?: "shared" | "separate";
 }) {
-  // ---------------------------------------------------------
-  // STEP 1 — Fetch bundle + component product data
-  // ---------------------------------------------------------
-
   const query = `#graphql
     query GetProducts($ids: [ID!]!) {
       nodes(ids: $ids) {
@@ -31,7 +165,7 @@ export async function syncBundleVariants({
             name
             optionValues { name }
           }
-          variants(first: 100) {
+          variants(first: 250) {
             nodes {
               id
               title
@@ -43,14 +177,14 @@ export async function syncBundleVariants({
     }
   `;
 
-  const res = await admin.graphql(query, {
-    variables: {
-      ids: [bundleProductId, componentProductAId, componentProductBId],
-    },
+  const json = await gql(admin, query, {
+    ids: [bundleProductId, componentProductAId, componentProductBId],
   });
 
-  const json = await res.json();
-  const [bundle, productA, productB] = json.data.nodes;
+  const [bundle, productA, productB] = json?.data?.nodes ?? [];
+  if (!bundle?.id || !productA?.id || !productB?.id) {
+    throw new Error("Could not load bundle + component products.");
+  }
 
   const aVariants = productA.variants.nodes;
   const bVariants = productB.variants.nodes;
@@ -58,9 +192,203 @@ export async function syncBundleVariants({
   const aDefaultOnly = isDefaultOnlyProduct(aVariants);
   const bDefaultOnly = isDefaultOnlyProduct(bVariants);
 
-  // ---------------------------------------------------------
-  // CASE 1 — BOTH SINGLE-VARIANT PRODUCTS (Perfume + Perfume)
-  // ---------------------------------------------------------
+  /* =========================================================
+     SEPARATE MODE
+     ========================================================= */
+  if (variantMode === "separate") {
+    const aPrefix = optionPrefix(productA.title);
+    const bPrefix = optionPrefix(productB.title);
+
+    const aOpts: Array<{ name: string; values: string[] }> = aDefaultOnly
+      ? []
+      : (productA.options ?? []).map((o: any) => ({
+          name: `${aPrefix}${o.name}`,
+          values: (o.optionValues ?? []).map((v: any) => v.name),
+        }));
+
+    const bOpts: Array<{ name: string; values: string[] }> = bDefaultOnly
+      ? []
+      : (productB.options ?? []).map((o: any) => ({
+          name: `${bPrefix}${o.name}`,
+          values: (o.optionValues ?? []).map((v: any) => v.name),
+        }));
+
+    const desiredOptions = [...aOpts, ...bOpts].filter((o) => o.values?.length);
+
+    if (!desiredOptions.length) {
+      const bundleVariant = bundle.variants.nodes[0];
+      await writeBundleMetafield({
+        admin,
+        variantId: bundleVariant.id,
+        componentVariantIds: [aVariants[0].id, bVariants[0].id],
+      });
+      return;
+    }
+
+    const missingDesiredOptions = desiredOptions.filter(
+      (o) => !hasRealOption(bundle.options ?? [], o.name),
+    );
+
+    if (missingDesiredOptions.length) {
+      await createOptions(
+        admin,
+        bundleProductId,
+        missingDesiredOptions.map((o) => ({
+          name: o.name,
+          values: o.values.map((v) => ({ name: v })),
+        })),
+      );
+    }
+
+    const optionsFetch = await gql(
+      admin,
+      `#graphql
+      query BundleOptionsAndVariants($id: ID!) {
+        product(id: $id) {
+          options {
+            id
+            name
+          }
+          variants(first: 250) {
+            nodes {
+              id
+              title
+              selectedOptions { name value }
+            }
+          }
+        }
+      }`,
+      { id: bundleProductId },
+    );
+
+    const bundleProduct = optionsFetch?.data?.product;
+    const optionIdByName = new Map<string, string>(
+      (bundleProduct?.options ?? []).map((o: any) => [o.name, o.id]),
+    );
+    const preExistingVariants = bundleProduct?.variants?.nodes ?? [];
+
+    const optionValueArrays = desiredOptions.map((o) =>
+      o.values.map((value) => ({ optionName: o.name, value })),
+    );
+
+    const combos = cartesian(optionValueArrays);
+    if (combos.length > 200) {
+      throw new Error(
+        `Separate Variant mode would create ${combos.length} variants (too many for v1). Reduce options/values.`,
+      );
+    }
+
+    const existingKey = new Set(
+      preExistingVariants.map((v: any) => optionsKeyFromSelectedOptions(v.selectedOptions ?? [])),
+    );
+
+    const variantsToCreate = combos
+      .filter((combo) => {
+        const key = combo
+          .map((o) => ({ name: o.optionName, value: o.value }))
+          .sort((a, b) => a.name.localeCompare(b.name))
+          .map((o) => `${normalize(o.name)}=${normalize(o.value)}`)
+          .join("|");
+        return !existingKey.has(key);
+      })
+      .map((combo) => ({
+        optionValues: combo.map((c) => {
+          const optionId = optionIdByName.get(c.optionName);
+          if (!optionId) throw new Error(`Bundle option not found: ${c.optionName}`);
+          return {
+            optionId,
+            name: c.value,
+          };
+        }),
+        price: "0.00",
+      }));
+
+    if (variantsToCreate.length) {
+      await createVariants(admin, bundleProductId, variantsToCreate);
+    }
+
+    const afterCreateFetch = await gql(
+      admin,
+      `#graphql
+      query BundleVariantsAfterCreate($id: ID!) {
+        product(id: $id) {
+          variants(first: 250) {
+            nodes {
+              id
+              title
+              selectedOptions { name value }
+            }
+          }
+        }
+      }`,
+      { id: bundleProductId },
+    );
+
+    const afterCreate = afterCreateFetch?.data?.product?.variants?.nodes ?? [];
+    const defaultVariant = afterCreate.find(
+      (v: any) => normalize(v.title) === "default title",
+    );
+
+    if (defaultVariant && afterCreate.length > 1) {
+      await deleteVariant(admin, bundleProductId, defaultVariant.id);
+    }
+
+    const final = await gql(
+      admin,
+      `#graphql
+      query FinalVariants($id: ID!) {
+        product(id: $id) {
+          variants(first: 250) {
+            nodes {
+              id
+              selectedOptions { name value }
+            }
+          }
+        }
+      }`,
+      { id: bundleProductId },
+    );
+
+    const finalVariants = final?.data?.product?.variants?.nodes ?? [];
+
+    const aDefaultId = aDefaultOnly ? aVariants[0].id : null;
+    const bDefaultId = bDefaultOnly ? bVariants[0].id : null;
+
+    for (const bv of finalVariants) {
+      const selected: Array<{ name: string; value: string }> = bv.selectedOptions ?? [];
+
+      const aWanted: Record<string, string> = {};
+      const bWanted: Record<string, string> = {};
+
+      for (const o of selected) {
+        if (o.name.startsWith(aPrefix)) aWanted[o.name.replace(aPrefix, "")] = o.value;
+        if (o.name.startsWith(bPrefix)) bWanted[o.name.replace(bPrefix, "")] = o.value;
+      }
+
+      const aVarId = aDefaultId
+        ? aDefaultId
+        : aVariants.find((v: any) => variantMatchesOptions(v, aWanted))?.id;
+
+      const bVarId = bDefaultId
+        ? bDefaultId
+        : bVariants.find((v: any) => variantMatchesOptions(v, bWanted))?.id;
+
+      if (!aVarId || !bVarId) continue;
+
+      await writeBundleMetafield({
+        admin,
+        variantId: bv.id,
+        componentVariantIds: [aVarId, bVarId],
+      });
+    }
+
+    return;
+  }
+
+  /* =========================================================
+     SHARED MODE
+     ========================================================= */
+
   if (aDefaultOnly && bDefaultOnly) {
     const bundleVariant = bundle.variants.nodes[0];
     await writeBundleMetafield({
@@ -71,19 +399,12 @@ export async function syncBundleVariants({
     return;
   }
 
-  // ---------------------------------------------------------
-  // CASE 1.5 — MIXED (One has variants, the other is Default Title)
-  // Bundle should follow the variant product’s option values.
-  // ---------------------------------------------------------
   const isMixed = (aDefaultOnly && !bDefaultOnly) || (!aDefaultOnly && bDefaultOnly);
 
   if (isMixed) {
-    // The "variant product" dictates the bundle's option + values
     const variantProduct = aDefaultOnly ? productB : productA;
-    const staticProduct = aDefaultOnly ? productA : productB;
-
     const variantProductVariants = aDefaultOnly ? bVariants : aVariants;
-    const staticVariantId = (aDefaultOnly ? aVariants[0].id : bVariants[0].id) as string;
+    const staticVariantId = aDefaultOnly ? aVariants[0].id : bVariants[0].id;
 
     const bundleOptionName = variantProduct.options?.[0]?.name;
     const optionValues =
@@ -93,43 +414,26 @@ export async function syncBundleVariants({
       throw new Error("No variant option found on the variant product.");
     }
 
-    // Ensure option exists on bundle
-    const bundleHasOption = bundle.options?.some(
+    const bundleHasOption = (bundle.options ?? []).some(
       (o: any) => normalize(o.name) === normalize(bundleOptionName),
     );
 
     if (!bundleHasOption) {
-      await admin.graphql(
-        `#graphql
-        mutation CreateOption($productId: ID!, $options: [OptionCreateInput!]!) {
-          productOptionsCreate(
-            productId: $productId
-            options: $options
-            variantStrategy: LEAVE_AS_IS
-          ) {
-            userErrors { field message }
-          }
-        }`,
+      await createOptions(admin, bundleProductId, [
         {
-          variables: {
-            productId: bundleProductId,
-            options: [
-              {
-                name: bundleOptionName,
-                values: optionValues.map((v: string) => ({ name: v })),
-              },
-            ],
-          },
+          name: bundleOptionName,
+          values: optionValues.map((v: string) => ({ name: v })),
         },
-      );
+      ]);
     }
 
-    // Refresh bundle variants after option creation
-    const refreshed = await admin.graphql(
+    const optionsFetch = await gql(
+      admin,
       `#graphql
-      query BundleRefresh($id: ID!) {
+      query BundleOptionsAndVariants($id: ID!) {
         product(id: $id) {
-          variants(first: 100) {
+          options { id name }
+          variants(first: 250) {
             nodes {
               id
               title
@@ -138,30 +442,15 @@ export async function syncBundleVariants({
           }
         }
       }`,
-      { variables: { id: bundleProductId } },
+      { id: bundleProductId },
     );
-    const refreshedJson = await refreshed.json();
-    let bundleVariants = refreshedJson.data.product.variants.nodes;
 
-    // If multiple option values, delete Default Title variant if present
-    if (optionValues.length > 1) {
-      const defaultVariant = bundleVariants.find(
-        (v: any) => normalize(v.title) === "default title",
-      );
-      if (defaultVariant) {
-        await admin.graphql(
-          `#graphql
-          mutation DeleteVariant($id: ID!) {
-            productVariantDelete(id: $id) {
-              userErrors { message }
-            }
-          }`,
-          { variables: { id: defaultVariant.id } },
-        );
-      }
-    }
+    const bundleProduct = optionsFetch?.data?.product;
+    const optionId = (bundleProduct?.options ?? []).find(
+      (o: any) => normalize(o.name) === normalize(bundleOptionName),
+    )?.id;
+    const bundleVariants = bundleProduct?.variants?.nodes ?? [];
 
-    // Create missing variants
     const existingValues = new Set(
       bundleVariants.map((v: any) => normalize(v.selectedOptions?.[0]?.value)),
     );
@@ -169,53 +458,53 @@ export async function syncBundleVariants({
     const variantsToCreate = optionValues
       .filter((value: string) => !existingValues.has(normalize(value)))
       .map((value: string) => ({
-        optionValues: [{ optionName: bundleOptionName, name: value }],
+        optionValues: [{ optionId, name: value }],
         price: "0.00",
       }));
 
     if (variantsToCreate.length) {
-      await admin.graphql(
-        `#graphql
-        mutation CreateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-          productVariantsBulkCreate(productId: $productId, variants: $variants) {
-            userErrors { field message }
-          }
-        }`,
-        { variables: { productId: bundleProductId, variants: variantsToCreate } },
-      );
+      await createVariants(admin, bundleProductId, variantsToCreate);
     }
 
-    // Final fetch of bundle variants to map metafields
-    const finalRes = await admin.graphql(
+    const afterCreateFetch = await gql(
+      admin,
       `#graphql
-      query FinalVariants($id: ID!) {
+      query BundleVariantsAfterCreate($id: ID!) {
         product(id: $id) {
-          variants(first: 100) {
+          variants(first: 250) {
             nodes {
               id
+              title
               selectedOptions { name value }
             }
           }
         }
       }`,
-      { variables: { id: bundleProductId } },
+      { id: bundleProductId },
     );
 
-    const finalJson = await finalRes.json();
-    const finalVariants = finalJson.data.product.variants.nodes;
+    const afterCreate = afterCreateFetch?.data?.product?.variants?.nodes ?? [];
+    if (optionValues.length > 1) {
+      const defaultVariant = afterCreate.find((v: any) => normalize(v.title) === "default title");
+      if (defaultVariant && afterCreate.length > 1) {
+        await deleteVariant(admin, bundleProductId, defaultVariant.id);
+      }
+    }
+
+    const finalVariants = afterCreate.filter((v: any) => normalize(v.title) !== "default title");
 
     for (const bv of finalVariants) {
       const value = bv.selectedOptions?.[0]?.value;
 
-      const matchedVariant = variantProductVariants.find(
+      const matched = variantProductVariants.find(
         (v: any) => normalize(v.selectedOptions?.[0]?.value) === normalize(value),
       );
 
-      if (!matchedVariant) continue;
+      if (!matched) continue;
 
       const componentVariantIds = aDefaultOnly
-        ? [staticVariantId, matchedVariant.id] // A default, B varies
-        : [matchedVariant.id, staticVariantId]; // A varies, B default
+        ? [staticVariantId, matched.id]
+        : [matched.id, staticVariantId];
 
       await writeBundleMetafield({
         admin,
@@ -227,12 +516,7 @@ export async function syncBundleVariants({
     return;
   }
 
-  // ---------------------------------------------------------
-  // CASE 2 — SHARED OPTION (Color, Size, etc) (original behavior)
-  // ---------------------------------------------------------
-
   const bundleOptionName = productA.options[0]?.name;
-
   const sharedValues =
     productA.options[0]?.optionValues
       ?.map((v: any) => v.name)
@@ -246,43 +530,26 @@ export async function syncBundleVariants({
     throw new Error("No shared variant option found.");
   }
 
-  const bundleHasOption = bundle.options.some(
+  const bundleHasOption = (bundle.options ?? []).some(
     (o: any) => normalize(o.name) === normalize(bundleOptionName),
   );
 
   if (!bundleHasOption) {
-    await admin.graphql(
-      `#graphql
-      mutation CreateOption($productId: ID!, $options: [OptionCreateInput!]!) {
-        productOptionsCreate(
-          productId: $productId
-          options: $options
-          variantStrategy: LEAVE_AS_IS
-        ) {
-          userErrors { field message }
-        }
-      }
-      `,
+    await createOptions(admin, bundleProductId, [
       {
-        variables: {
-          productId: bundleProductId,
-          options: [
-            {
-              name: bundleOptionName,
-              values: sharedValues.map((v: string) => ({ name: v })),
-            },
-          ],
-        },
+        name: bundleOptionName,
+        values: sharedValues.map((v: string) => ({ name: v })),
       },
-    );
+    ]);
   }
 
-  const updatedRes = await admin.graphql(
+  const optionsFetch = await gql(
+    admin,
     `#graphql
-    query BundleRefresh($id: ID!) {
+    query BundleOptionsAndVariants($id: ID!) {
       product(id: $id) {
-        options { name optionValues { name } }
-        variants(first: 100) {
+        options { id name }
+        variants(first: 250) {
           nodes {
             id
             title
@@ -290,33 +557,15 @@ export async function syncBundleVariants({
           }
         }
       }
-    }
-    `,
-    { variables: { id: bundleProductId } },
+    }`,
+    { id: bundleProductId },
   );
 
-  const updatedJson = await updatedRes.json();
-  const bundleProduct = updatedJson.data.product;
-  const bundleVariants = bundleProduct.variants.nodes;
-
-  if (sharedValues.length > 1) {
-    const defaultVariant = bundleVariants.find(
-      (v: any) => normalize(v.title) === "default title",
-    );
-
-    if (defaultVariant) {
-      await admin.graphql(
-        `#graphql
-        mutation DeleteVariant($id: ID!) {
-          productVariantDelete(id: $id) {
-            userErrors { message }
-          }
-        }
-        `,
-        { variables: { id: defaultVariant.id } },
-      );
-    }
-  }
+  const bundleProduct = optionsFetch?.data?.product;
+  const optionId = (bundleProduct?.options ?? []).find(
+    (o: any) => normalize(o.name) === normalize(bundleOptionName),
+  )?.id;
+  const bundleVariants = bundleProduct?.variants?.nodes ?? [];
 
   const existingValues = new Set(
     bundleVariants.map((v: any) => normalize(v.selectedOptions?.[0]?.value)),
@@ -325,51 +574,41 @@ export async function syncBundleVariants({
   const variantsToCreate = sharedValues
     .filter((value: string) => !existingValues.has(normalize(value)))
     .map((value: string) => ({
-      optionValues: [
-        {
-          optionName: bundleOptionName,
-          name: value,
-        },
-      ],
+      optionValues: [{ optionId, name: value }],
       price: "0.00",
     }));
 
   if (variantsToCreate.length) {
-    await admin.graphql(
-      `#graphql
-      mutation CreateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-        productVariantsBulkCreate(productId: $productId, variants: $variants) {
-          userErrors { field message }
-        }
-      }
-      `,
-      {
-        variables: {
-          productId: bundleProductId,
-          variants: variantsToCreate,
-        },
-      },
-    );
+    await createVariants(admin, bundleProductId, variantsToCreate);
   }
 
-  const finalRes = await admin.graphql(
+  const afterCreateFetch = await gql(
+    admin,
     `#graphql
-    query FinalVariants($id: ID!) {
+    query BundleVariantsAfterCreate($id: ID!) {
       product(id: $id) {
-        variants(first: 100) {
+        variants(first: 250) {
           nodes {
             id
+            title
             selectedOptions { name value }
           }
         }
       }
-    }
-    `,
-    { variables: { id: bundleProductId } },
+    }`,
+    { id: bundleProductId },
   );
 
-  const finalJson = await finalRes.json();
-  const finalVariants = finalJson.data.product.variants.nodes;
+  const afterCreate = afterCreateFetch?.data?.product?.variants?.nodes ?? [];
+
+  if (sharedValues.length > 1) {
+    const defaultVariant = afterCreate.find((v: any) => normalize(v.title) === "default title");
+    if (defaultVariant && afterCreate.length > 1) {
+      await deleteVariant(admin, bundleProductId, defaultVariant.id);
+    }
+  }
+
+  const finalVariants = afterCreate.filter((v: any) => normalize(v.title) !== "default title");
 
   for (const variant of finalVariants) {
     const value = variant.selectedOptions?.[0]?.value;
@@ -390,41 +629,4 @@ export async function syncBundleVariants({
       componentVariantIds: [componentAVariant.id, componentBVariant.id],
     });
   }
-}
-
-// ---------------------------------------------------------
-// WRITE METAFIELD HELPER
-// ---------------------------------------------------------
-
-async function writeBundleMetafield({
-  admin,
-  variantId,
-  componentVariantIds,
-}: {
-  admin: any;
-  variantId: string;
-  componentVariantIds: string[];
-}) {
-  await admin.graphql(
-    `#graphql
-    mutation SetMetafield($metafields: [MetafieldsSetInput!]!) {
-      metafieldsSet(metafields: $metafields) {
-        userErrors { field message }
-      }
-    }
-    `,
-    {
-      variables: {
-        metafields: [
-          {
-            ownerId: variantId,
-            namespace: "simple_bundler",
-            key: "components",
-            type: "json",
-            value: JSON.stringify(componentVariantIds),
-          },
-        ],
-      },
-    },
-  );
 }

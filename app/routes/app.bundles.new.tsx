@@ -23,11 +23,10 @@ import db from "../db.server";
 import { authenticate } from "../shopify.server";
 import { syncBundleVariants } from "../utils/syncBundleVariants.server";
 
-type ProductItem = {
-  id: string;
-  title: string;
-  handle: string;
-};
+type ProductItem = { id: string; title: string; handle: string };
+type LoaderData = { products: ProductItem[] };
+
+type VariantMode = "shared" | "separate";
 
 type ActionData =
   | {
@@ -38,13 +37,10 @@ type ActionData =
         handle?: string;
         productA?: string;
         productB?: string;
+        variantMode?: VariantMode;
       };
     }
   | undefined;
-
-/* -----------------------------
-   LOADER
--------------------------------- */
 
 export async function loader({ request }: { request: Request }) {
   const { admin } = await authenticate.admin(request);
@@ -52,85 +48,57 @@ export async function loader({ request }: { request: Request }) {
   const res = await admin.graphql(
     `#graphql
     query ProductsForBundle {
-      products(first: 50) {
+      products(first: 100) {
         edges {
-          node {
-            id
-            title
-            handle
-          }
+          node { id title handle }
         }
       }
     }`,
   );
 
   const json = await res.json();
-
   const products: ProductItem[] =
     json?.data?.products?.edges?.map((e: any) => e.node) ?? [];
 
-  return { products };
+  return { products } satisfies LoaderData;
 }
-
-/* -----------------------------
-   ACTION
--------------------------------- */
 
 export async function action({ request }: { request: Request }) {
   const { admin, session, redirect } = await authenticate.admin(request);
 
   const form = await request.formData();
-
   const title = String(form.get("title") || "").trim();
   const handle = String(form.get("handle") || "").trim();
   const productA = String(form.get("productA") || "");
   const productB = String(form.get("productB") || "");
+  const variantMode = (String(form.get("variantMode") || "shared") as VariantMode) || "shared";
 
   if (!title || !handle || !productA || !productB) {
     return {
       ok: false,
-      error:
-        "Please enter a bundle name, handle, and choose 2 component products.",
-      fields: { title, handle, productA, productB },
-    };
+      error: "Please enter a bundle name + handle and choose 2 products.",
+      fields: { title, handle, productA, productB, variantMode },
+    } satisfies ActionData;
   }
 
   if (productA === productB) {
     return {
       ok: false,
       error: "Please choose two different products.",
-      fields: { title, handle, productA, productB },
-    };
+      fields: { title, handle, productA, productB, variantMode },
+    } satisfies ActionData;
   }
 
-  /* -----------------------------
-     1️⃣ Create bundle product
-  -------------------------------- */
-
+  // 1) Create bundle parent product (draft)
   const createRes = await admin.graphql(
     `#graphql
     mutation CreateBundleProduct($input: ProductInput!) {
       productCreate(input: $input) {
-        product {
-          id
-          title
-          handle
-        }
-        userErrors {
-          field
-          message
-        }
+        product { id title handle }
+        userErrors { field message }
       }
     }`,
-    {
-      variables: {
-        input: {
-          title,
-          handle,
-          status: "DRAFT",
-        },
-      },
-    },
+    { variables: { input: { title, handle, status: "DRAFT" } } },
   );
 
   const createJson = await createRes.json();
@@ -141,15 +109,12 @@ export async function action({ request }: { request: Request }) {
     return {
       ok: false,
       error: userErrors[0]?.message || "Product creation failed.",
-      fields: { title, handle, productA, productB },
-    };
+      fields: { title, handle, productA, productB, variantMode },
+    } satisfies ActionData;
   }
 
-  /* -----------------------------
-     2️⃣ Save bundle in DB
-  -------------------------------- */
-
-  await db.bundle.create({
+  // 2) Save bundle in DB
+  const bundleRow = await db.bundle.create({
     data: {
       shop: session.shop,
       parentProductId: product.id,
@@ -163,76 +128,75 @@ export async function action({ request }: { request: Request }) {
         ],
       },
     },
+    select: { id: true },
   });
 
-  /* -----------------------------
-     3️⃣ Sync variants + metafields
-  -------------------------------- */
-
+  // 3) Sync variants + mapping (shared OR separate)
   try {
     await syncBundleVariants({
       admin,
       bundleProductId: product.id,
       componentProductAId: productA,
       componentProductBId: productB,
+      variantMode,
     });
   } catch (e: any) {
     return {
       ok: false,
-      error: e?.message || "Bundle created but variant sync failed.",
-      fields: { title, handle, productA, productB },
-    };
+      error: e?.message || "Bundle created but sync failed.",
+      fields: { title, handle, productA, productB, variantMode },
+    } satisfies ActionData;
   }
 
-  return redirect("/app/bundles");
+  return redirect(`/app/bundles/${bundleRow.id}`);
 }
 
-/* -----------------------------
-   COMPONENT
--------------------------------- */
-
 export default function BundleCreate() {
-  const { products } = useLoaderData() as { products: ProductItem[] };
+  const { products } = useLoaderData() as LoaderData;
   const actionData = useActionData() as ActionData;
   const nav = useNavigation();
   const navigate = useNavigate();
 
   const [title, setTitle] = useState(actionData?.fields?.title ?? "");
   const [handle, setHandle] = useState(actionData?.fields?.handle ?? "");
-  const [productA, setProductA] = useState(
-    actionData?.fields?.productA ?? "",
-  );
-  const [productB, setProductB] = useState(
-    actionData?.fields?.productB ?? "",
+  const [productA, setProductA] = useState(actionData?.fields?.productA ?? "");
+  const [productB, setProductB] = useState(actionData?.fields?.productB ?? "");
+  const [variantMode, setVariantMode] = useState<VariantMode>(
+    actionData?.fields?.variantMode ?? "shared",
   );
 
-  const options = useMemo(
+  const productOptions = useMemo(
     () => [
       { label: "Select a product...", value: "" },
-      ...products.map((p) => ({
-        label: p.title,
-        value: p.id,
-      })),
+      ...products.map((p) => ({ label: p.title, value: p.id })),
     ],
     [products],
   );
+
+  const variantModeOptions = [
+    {
+      label: "Shared Variant (1 selector if values match)",
+      value: "shared",
+    },
+    {
+      label: "Separate Variant (2 selectors, supports mismatched values/options)",
+      value: "separate",
+    },
+  ];
 
   const busy = nav.state !== "idle";
 
   return (
     <Page
       title="Create bundle"
-      backAction={{
-        content: "Bundles",
-        onAction: () => navigate("/app/bundles"),
-      }}
+      backAction={{ content: "Bundles", onAction: () => navigate("/app/bundles") }}
     >
       <BlockStack gap="400">
-        {actionData?.ok === false && (
+        {actionData?.ok === false ? (
           <Banner tone="critical" title="Couldn’t create bundle">
             <p>{actionData.error}</p>
           </Banner>
-        )}
+        ) : null}
 
         <Card>
           <Form method="post">
@@ -256,9 +220,17 @@ export default function BundleCreate() {
                 />
 
                 <Select
+                  label="Variant mode"
+                  name="variantMode"
+                  options={variantModeOptions}
+                  value={variantMode}
+                  onChange={(v) => setVariantMode(v as VariantMode)}
+                />
+
+                <Select
                   label="Component product 1"
                   name="productA"
-                  options={options}
+                  options={productOptions}
                   value={productA}
                   onChange={setProductA}
                 />
@@ -266,14 +238,14 @@ export default function BundleCreate() {
                 <Select
                   label="Component product 2"
                   name="productB"
-                  options={options}
+                  options={productOptions}
                   value={productB}
                   onChange={setProductB}
                 />
               </FormLayout>
 
               <InlineStack align="end" gap="200">
-                <Button onClick={() => navigate("/app/bundles")}>
+                <Button onClick={() => navigate("/app/bundles")} disabled={busy}>
                   Cancel
                 </Button>
                 <Button variant="primary" submit disabled={busy}>
@@ -281,12 +253,11 @@ export default function BundleCreate() {
                 </Button>
               </InlineStack>
 
-              {products.length === 0 && (
+              {products.length === 0 ? (
                 <Text as="p" tone="subdued">
-                  No products found yet. Create 2 test products in the store
-                  first.
+                  No products found yet. Create 2 test products in the store first.
                 </Text>
-              )}
+              ) : null}
             </BlockStack>
           </Form>
         </Card>
