@@ -82,6 +82,7 @@ type LoaderData = {
     id: string;
     title: string;
     productHandlePath: string;
+    shopifyAdminProductUrl: string;
     status: string;
     parentProductId: string;
     variantMode: VariantMode;
@@ -130,6 +131,7 @@ function badgeTone(status: string) {
 export async function loader({ request, params }: LoaderFunctionArgs) {
   const { admin, session } = await authenticate.admin(request);
   const id = params.id;
+  const shopAdminBase = `https://${session.shop}/admin`;
 
   if (!id) throw new Response("Missing bundle id", { status: 400 });
 
@@ -190,6 +192,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   const handle = parent?.handle || bundle.handle || "";
   const status = (parent?.status || bundle.status || "UNKNOWN").toLowerCase();
   const productHandlePath = handle ? `/products/${handle}` : "/products/unknown";
+  const parentProductNumericId = bundle.parentProductId.split("/").pop() || "";
 
   const components = bundle.components.map((c) => {
     const p = productsById[c.productId];
@@ -207,6 +210,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       id: bundle.id,
       title,
       productHandlePath,
+      shopifyAdminProductUrl: `${shopAdminBase}/products/${parentProductNumericId}`,
       status,
       parentProductId: bundle.parentProductId,
       variantMode: (bundle.variantMode as VariantMode) || "shared",
@@ -446,12 +450,22 @@ export default function BundleDetails() {
                     </Text>
                   </BlockStack>
 
-                  <Form method="post" id="sync-form">
-                    <input type="hidden" name="intent" value="sync" />
-                    <Button submit loading={busy}>
-                      Sync components
+                  <InlineStack gap="200">
+                    <Button
+                      url={bundle.shopifyAdminProductUrl}
+                      target="_blank"
+                      variant="secondary"
+                    >
+                      Open in Shopify Admin
                     </Button>
-                  </Form>
+
+                    <Form method="post" id="sync-form">
+                      <input type="hidden" name="intent" value="sync" />
+                      <Button submit loading={busy}>
+                        Sync components
+                      </Button>
+                    </Form>
+                  </InlineStack>
                 </InlineStack>
               </Box>
             </Card>
