@@ -113,26 +113,29 @@ export async function action({ request }: { request: Request }) {
     } satisfies ActionData;
   }
 
-  // 2) Save bundle in DB
-  const bundleRow = await db.bundle.create({
-    data: {
-      shop: session.shop,
-      parentProductId: product.id,
-      title: product.title,
-      handle: product.handle,
-      status: "draft",
-      components: {
-        create: [
-          { position: 1, productId: productA },
-          { position: 2, productId: productB },
-        ],
-      },
-    },
-    select: { id: true },
-  });
+  let bundleRow: { id: string } | null = null;
 
-  // 3) Sync variants + mapping (shared OR separate)
   try {
+    // 2) Save bundle in DB
+    bundleRow = await db.bundle.create({
+      data: {
+        shop: session.shop,
+        parentProductId: product.id,
+        title: product.title,
+        handle: product.handle,
+        status: "draft",
+        variantMode,
+        components: {
+          create: [
+            { position: 1, productId: productA },
+            { position: 2, productId: productB },
+          ],
+        },
+      },
+      select: { id: true },
+    });
+
+    // 3) Sync variants + mapping
     await syncBundleVariants({
       admin,
       bundleProductId: product.id,
@@ -141,6 +144,17 @@ export async function action({ request }: { request: Request }) {
       variantMode,
     });
   } catch (e: any) {
+    // Best-effort cleanup if sync fails after create
+    if (bundleRow?.id) {
+      try {
+        await db.bundle.delete({
+          where: { id: bundleRow.id },
+        });
+      } catch {
+        // ignore cleanup failure
+      }
+    }
+
     return {
       ok: false,
       error: e?.message || "Bundle created but sync failed.",
