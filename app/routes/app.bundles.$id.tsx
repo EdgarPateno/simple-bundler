@@ -86,6 +86,7 @@ type LoaderData = {
     status: string;
     parentProductId: string;
     variantMode: VariantMode;
+    bundleIncludesText: string;
     components: Array<{
       position: number;
       productId: string;
@@ -107,6 +108,7 @@ type ActionData =
         productA?: string;
         productB?: string;
         variantMode?: VariantMode;
+        bundleIncludesText?: string;
       };
     }
   | undefined;
@@ -144,6 +146,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       status: true,
       parentProductId: true,
       variantMode: true,
+      bundleIncludesText: true,
       components: {
         orderBy: { position: "asc" },
         select: { position: true, productId: true },
@@ -153,7 +156,6 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
   if (!bundle) throw new Response("Bundle not found", { status: 404 });
 
-  // Products list for Select dropdowns
   const productsResp = await admin.graphql(PRODUCTS_LIST);
   const productsJson = await productsResp.json();
   const products: ProductItem[] =
@@ -164,7 +166,6 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       status: String(e.node.status ?? "UNKNOWN").toLowerCase(),
     })) ?? [];
 
-  // Shopify info for parent + components for nicer UI
   const productIds = [
     bundle.parentProductId,
     ...bundle.components.map((c) => c.productId),
@@ -214,6 +215,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       status,
       parentProductId: bundle.parentProductId,
       variantMode: (bundle.variantMode as VariantMode) || "shared",
+      bundleIncludesText: bundle.bundleIncludesText || "",
       components,
     },
     products,
@@ -245,9 +247,6 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
   if (!bundle) return { ok: false, error: "Bundle not found." } satisfies ActionData;
 
-  // -----------------
-  // SYNC (safe, uses one source of truth)
-  // -----------------
   if (intent === "sync") {
     if (bundle.components.length < 2) {
       return { ok: false, error: "Bundle must have 2 component products to sync." } satisfies ActionData;
@@ -277,20 +276,18 @@ export async function action({ request, params }: ActionFunctionArgs) {
     return { ok: true, message: "Synced components successfully." } satisfies ActionData;
   }
 
-  // -----------------
-  // SAVE (Edit bundle safely: title + components + variant mode; do not change handle)
-  // -----------------
   if (intent === "save") {
     const title = String(formData.get("title") || "").trim();
     const productA = String(formData.get("productA") || "");
     const productB = String(formData.get("productB") || "");
     const variantMode = (String(formData.get("variantMode") || "shared") as VariantMode) || "shared";
+    const bundleIncludesText = String(formData.get("bundleIncludesText") || "").trim();
 
     if (!title || !productA || !productB) {
       return {
         ok: false,
         error: "Please enter a bundle name and choose 2 products.",
-        fields: { title, productA, productB, variantMode },
+        fields: { title, productA, productB, variantMode, bundleIncludesText },
       } satisfies ActionData;
     }
 
@@ -298,11 +295,10 @@ export async function action({ request, params }: ActionFunctionArgs) {
       return {
         ok: false,
         error: "Please choose two different products.",
-        fields: { title, productA, productB, variantMode },
+        fields: { title, productA, productB, variantMode, bundleIncludesText },
       } satisfies ActionData;
     }
 
-    // 1) Update Shopify parent product TITLE only (safe: URL/handle unchanged)
     const updResp = await admin.graphql(PRODUCT_UPDATE_TITLE, {
       variables: { input: { id: bundle.parentProductId, title } },
     });
@@ -313,16 +309,16 @@ export async function action({ request, params }: ActionFunctionArgs) {
       return {
         ok: false,
         error: updErrors[0]?.message || "Failed to update Shopify product title.",
-        fields: { title, productA, productB, variantMode },
+        fields: { title, productA, productB, variantMode, bundleIncludesText },
       } satisfies ActionData;
     }
 
-    // 2) Update DB bundle title + variant mode + replace components
     await db.bundle.update({
       where: { id: bundle.id },
       data: {
         title,
         variantMode,
+        bundleIncludesText: bundleIncludesText || null,
         components: {
           deleteMany: {},
           create: [
@@ -334,7 +330,6 @@ export async function action({ request, params }: ActionFunctionArgs) {
       },
     });
 
-    // 3) Re-sync so checkout expands using NEW components + chosen mode
     try {
       await syncBundleVariants({
         admin,
@@ -347,7 +342,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
       return {
         ok: false,
         error: "Saved changes, but sync failed: " + (e?.message || "Unknown error"),
-        fields: { title, productA, productB, variantMode },
+        fields: { title, productA, productB, variantMode, bundleIncludesText },
       } satisfies ActionData;
     }
 
@@ -383,6 +378,11 @@ export default function BundleDetails() {
   );
   const [variantMode, setVariantMode] = useState<VariantMode>(
     actionData?.ok === false ? actionData.fields?.variantMode ?? bundle.variantMode : bundle.variantMode,
+  );
+  const [bundleIncludesText, setBundleIncludesText] = useState(
+    actionData?.ok === false
+      ? actionData.fields?.bundleIncludesText ?? bundle.bundleIncludesText
+      : bundle.bundleIncludesText,
   );
 
   const options = useMemo(
@@ -501,6 +501,16 @@ export default function BundleDetails() {
                         onChange={(v) => setVariantMode(v as VariantMode)}
                       />
 
+                      <TextField
+                        label="Bundle includes text"
+                        name="bundleIncludesText"
+                        value={bundleIncludesText}
+                        onChange={setBundleIncludesText}
+                        autoComplete="off"
+                        multiline={3}
+                        helpText='Example: THIS BUNDLE COMES WITH:'
+                      />
+
                       <Select
                         label="Component product 1"
                         name="productA"
@@ -528,7 +538,7 @@ export default function BundleDetails() {
                     </InlineStack>
 
                     <Text as="p" tone="subdued">
-                      Safe edit: this updates the bundle product title, variant mode, and component products,
+                      Safe edit: this updates the bundle product title, variant mode, bundle includes text, and component products,
                       but keeps the bundle URL/handle unchanged. If you want to change the URL/handle, please update the parent product in Shopify directly and then click "Sync components" to pull in changes.
                     </Text>
                   </BlockStack>

@@ -1,0 +1,33 @@
+{% assign block_id = 'simple-bundler-block-' | append: block.id %}
+
+<div
+  id="{{ block_id }}"
+  class="simple-bundler-block"
+  data-endpoint="/apps/simple-bundler?product_id={{ product.id }}"
+  data-fallback-heading="{{ block.settings.fallback_heading | escape }}"
+  {{ block.shopify_attributes }}
+>
+  {% if request.design_mode %}
+    <div class="simple-bundler-placeholder">
+      <p><strong>Simple Bundler</strong></p>
+      <p>This block will show the bundle text and component list on bundle product pages.</p>
+    </div>
+  {% endif %}
+</div>
+
+{% schema %}
+{
+  "name": "Bundle components",
+  "target": "section",
+  "stylesheet": "bundle-components.css",
+  "javascript": "bundle-components.js",
+  "settings": [
+    {
+      "type": "text",
+      "id": "fallback_heading",
+      "label": "Fallback heading",
+      "default": "THIS BUNDLE COMES WITH:"
+    }
+  ]
+}
+{% endschema %}

@@ -1,0 +1,25 @@
+.simple-bundler-components {
+  margin-top: 1rem;
+}
+
+.simple-bundler-components__heading {
+  margin: 0 0 0.5rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.simple-bundler-components__list {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
+.simple-bundler-components__item {
+  margin: 0.2rem 0;
+}
+
+.simple-bundler-placeholder {
+  padding: 0.75rem 1rem;
+  border: 1px dashed rgba(0, 0, 0, 0.2);
+  border-radius: 0.5rem;
+}

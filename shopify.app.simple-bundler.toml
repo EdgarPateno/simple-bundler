@@ -19,3 +19,8 @@ use_legacy_install_flow = false
 
 [auth]
 redirect_urls = [ ]
+
+[app_proxy]
+url = "/public/bundle-data"
+prefix = "apps"
+subpath = "simple-bundler"

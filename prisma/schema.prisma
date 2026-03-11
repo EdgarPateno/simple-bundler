@@ -36,23 +36,24 @@ model Session {
 }
 
 model Bundle {
-  id              String       @id @default(cuid())
-  shop            String
-  parentProductId String
-  handle          String
-  title           String
-  variantMode     VariantMode  @default(shared)
+  id                 String       @id @default(cuid())
+  shop               String
+  parentProductId    String
+  handle             String
+  title              String
+  variantMode        VariantMode  @default(shared)
+  bundleIncludesText String?
 
-  status          String       @default("draft") // draft|active|archived
-  health          String       @default("ok")    // ok|needs_attention
-  issuesCount     Int          @default(0)
-  lastValidatedAt DateTime?
+  status             String       @default("draft") // draft|active|archived
+  health             String       @default("ok")    // ok|needs_attention
+  issuesCount        Int          @default(0)
+  lastValidatedAt    DateTime?
 
-  components      BundleComponent[]
-  options         BundleOption[]
+  components         BundleComponent[]
+  options            BundleOption[]
 
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
 
   @@unique([shop, parentProductId])
   @@unique([shop, handle])
