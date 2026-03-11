@@ -14,6 +14,40 @@ const PRODUCTS_BY_ID = `#graphql
   }
 `;
 
+const BUNDLE_VARIANT_COMPONENTS = `#graphql
+  query BundleVariantComponents($id: ID!) {
+    node(id: $id) {
+      ... on ProductVariant {
+        id
+        title
+        product {
+          id
+          title
+        }
+        metafield(namespace: "simple_bundler", key: "components") {
+          value
+        }
+      }
+    }
+  }
+`;
+
+const VARIANTS_BY_ID = `#graphql
+  query VariantsById($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on ProductVariant {
+        id
+        title
+        product {
+          id
+          title
+          handle
+        }
+      }
+    }
+  }
+`;
+
 function json(data: unknown, init?: ResponseInit) {
   return new Response(JSON.stringify(data), {
     status: init?.status ?? 200,
@@ -25,11 +59,20 @@ function json(data: unknown, init?: ResponseInit) {
   });
 }
 
+function toVariantDisplayTitle(productTitle: string, variantTitle: string) {
+  if (!variantTitle || variantTitle.trim().toLowerCase() === "default title") {
+    return productTitle;
+  }
+  return `${productTitle} ${variantTitle}`.trim();
+}
+
 export async function loader({ request }: LoaderFunctionArgs) {
   const { session, admin } = await authenticate.public.appProxy(request);
   const url = new URL(request.url);
 
   const rawProductId = String(url.searchParams.get("product_id") || "").trim();
+  const rawVariantId = String(url.searchParams.get("variant_id") || "").trim();
+
   if (!rawProductId) {
     return json(
       {
@@ -53,6 +96,12 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const gidProductId = rawProductId.startsWith("gid://shopify/Product/")
     ? rawProductId
     : `gid://shopify/Product/${rawProductId}`;
+
+  const gidVariantId = rawVariantId
+    ? rawVariantId.startsWith("gid://shopify/ProductVariant/")
+      ? rawVariantId
+      : `gid://shopify/ProductVariant/${rawVariantId}`
+    : "";
 
   const bundle = await db.bundle.findFirst({
     where: {
@@ -89,7 +138,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   let components: Array<{
     position: number;
-    productId: string;
+    productId?: string;
+    variantId?: string;
     title: string;
     handle: string;
   }> = bundle.components.map((c) => ({
@@ -99,6 +149,56 @@ export async function loader({ request }: LoaderFunctionArgs) {
     handle: "",
   }));
 
+  // Preferred path: use selected bundle variant metafield to return mapped component variant titles
+  if (gidVariantId && admin) {
+    const bundleVariantResp = await admin.graphql(BUNDLE_VARIANT_COMPONENTS, {
+      variables: { id: gidVariantId },
+    });
+    const bundleVariantJson = await bundleVariantResp.json();
+    const bundleVariant = bundleVariantJson?.data?.node;
+
+    const componentVariantIds = (() => {
+      try {
+        const raw = bundleVariant?.metafield?.value;
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+      } catch {
+        return [];
+      }
+    })();
+
+    if (
+      bundleVariant?.product?.id === gidProductId &&
+      componentVariantIds.length > 0
+    ) {
+      const variantsResp = await admin.graphql(VARIANTS_BY_ID, {
+        variables: { ids: componentVariantIds },
+      });
+      const variantsJson = await variantsResp.json();
+
+      const variantNodes = (variantsJson?.data?.nodes ?? []).filter(Boolean);
+
+      components = variantNodes.map((node: any, index: number) => ({
+        position: index + 1,
+        variantId: node.id,
+        productId: node.product?.id,
+        title: toVariantDisplayTitle(node.product?.title || "", node.title || ""),
+        handle: node.product?.handle || "",
+      }));
+
+      return json({
+        ok: true,
+        found: true,
+        bundleId: bundle.id,
+        bundleTitle: bundle.title,
+        bundleHandle: bundle.handle,
+        bundleIncludesText: bundle.bundleIncludesText || "",
+        components,
+      });
+    }
+  }
+
+  // Fallback: return component product titles only
   if (bundle.components.length && admin) {
     const resp = await admin.graphql(PRODUCTS_BY_ID, {
       variables: {
