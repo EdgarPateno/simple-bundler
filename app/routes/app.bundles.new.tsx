@@ -34,13 +34,22 @@ type ActionData =
       error: string;
       fields?: {
         title?: string;
-        handle?: string;
         productA?: string;
         productB?: string;
         variantMode?: VariantMode;
       };
     }
   | undefined;
+
+function slugifyHandle(value: string) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/['"]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-");
+}
 
 export async function loader({ request }: { request: Request }) {
   const { admin } = await authenticate.admin(request);
@@ -68,7 +77,7 @@ export async function action({ request }: { request: Request }) {
 
   const form = await request.formData();
   const title = String(form.get("title") || "").trim();
-  const handle = String(form.get("handle") || "").trim();
+  const handle = slugifyHandle(title);
   const productA = String(form.get("productA") || "");
   const productB = String(form.get("productB") || "");
   const variantMode = (String(form.get("variantMode") || "shared") as VariantMode) || "shared";
@@ -76,8 +85,8 @@ export async function action({ request }: { request: Request }) {
   if (!title || !handle || !productA || !productB) {
     return {
       ok: false,
-      error: "Please enter a bundle name + handle and choose 2 products.",
-      fields: { title, handle, productA, productB, variantMode },
+      error: "Please enter a bundle name and choose 2 products.",
+      fields: { title, productA, productB, variantMode },
     } satisfies ActionData;
   }
 
@@ -85,11 +94,10 @@ export async function action({ request }: { request: Request }) {
     return {
       ok: false,
       error: "Please choose two different products.",
-      fields: { title, handle, productA, productB, variantMode },
+      fields: { title, productA, productB, variantMode },
     } satisfies ActionData;
   }
 
-  // 1) Create bundle parent product (draft)
   const createRes = await admin.graphql(
     `#graphql
     mutation CreateBundleProduct($input: ProductInput!) {
@@ -109,14 +117,13 @@ export async function action({ request }: { request: Request }) {
     return {
       ok: false,
       error: userErrors[0]?.message || "Product creation failed.",
-      fields: { title, handle, productA, productB, variantMode },
+      fields: { title, productA, productB, variantMode },
     } satisfies ActionData;
   }
 
   let bundleRow: { id: string } | null = null;
 
   try {
-    // 2) Save bundle in DB
     bundleRow = await db.bundle.create({
       data: {
         shop: session.shop,
@@ -135,7 +142,6 @@ export async function action({ request }: { request: Request }) {
       select: { id: true },
     });
 
-    // 3) Sync variants + mapping
     await syncBundleVariants({
       admin,
       bundleProductId: product.id,
@@ -144,7 +150,6 @@ export async function action({ request }: { request: Request }) {
       variantMode,
     });
   } catch (e: any) {
-    // Best-effort cleanup if sync fails after create
     if (bundleRow?.id) {
       try {
         await db.bundle.delete({
@@ -158,7 +163,7 @@ export async function action({ request }: { request: Request }) {
     return {
       ok: false,
       error: e?.message || "Bundle created but sync failed.",
-      fields: { title, handle, productA, productB, variantMode },
+      fields: { title, productA, productB, variantMode },
     } satisfies ActionData;
   }
 
@@ -172,7 +177,6 @@ export default function BundleCreate() {
   const navigate = useNavigate();
 
   const [title, setTitle] = useState(actionData?.fields?.title ?? "");
-  const [handle, setHandle] = useState(actionData?.fields?.handle ?? "");
   const [productA, setProductA] = useState(actionData?.fields?.productA ?? "");
   const [productB, setProductB] = useState(actionData?.fields?.productB ?? "");
   const [variantMode, setVariantMode] = useState<VariantMode>(
@@ -199,6 +203,7 @@ export default function BundleCreate() {
   ];
 
   const busy = nav.state !== "idle";
+  const autoHandle = slugifyHandle(title);
 
   return (
     <Page
@@ -224,14 +229,9 @@ export default function BundleCreate() {
                   autoComplete="off"
                 />
 
-                <TextField
-                  label="Bundle handle"
-                  name="handle"
-                  value={handle}
-                  onChange={setHandle}
-                  autoComplete="off"
-                  helpText="Used for /products/<handle> (letters, numbers, hyphens)."
-                />
+                <Text as="p" tone="subdued">
+                  Bundle handle: {autoHandle || "Will be generated from bundle name"}
+                </Text>
 
                 <Select
                   label="Variant mode"
