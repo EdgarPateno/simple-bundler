@@ -1,3 +1,5 @@
+
+
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import {
   Form,
@@ -40,6 +42,19 @@ const PRODUCTS_BY_ID = `#graphql
         title
         handle
         status
+        options {
+          name
+        }
+        variants(first: 100) {
+          nodes {
+            id
+            title
+            selectedOptions {
+              name
+              value
+            }
+          }
+        }
       }
     }
   }
@@ -77,6 +92,21 @@ type VariantMode = "shared" | "separate";
 
 type ProductItem = { id: string; title: string; handle: string; status: string };
 
+type ComponentVariantItem = {
+  id: string;
+  title: string;
+  displayTitle: string;
+  selectedOptions: Array<{
+    name: string;
+    value: string;
+  }>;
+};
+
+type ComponentOptionGroup = {
+  name: string;
+  values: string[];
+};
+
 type LoaderData = {
   bundle: {
     id: string;
@@ -93,6 +123,8 @@ type LoaderData = {
       title: string;
       handle: string;
       status: string;
+      variants: ComponentVariantItem[];
+      optionGroups: ComponentOptionGroup[];
     }>;
   };
   products: ProductItem[];
@@ -101,16 +133,16 @@ type LoaderData = {
 type ActionData =
   | { ok: true; message: string }
   | {
-      ok: false;
-      error: string;
-      fields?: {
-        title?: string;
-        productA?: string;
-        productB?: string;
-        variantMode?: VariantMode;
-        bundleIncludesText?: string;
-      };
-    }
+    ok: false;
+    error: string;
+    fields?: {
+      title?: string;
+      productA?: string;
+      productB?: string;
+      variantMode?: VariantMode;
+      bundleIncludesText?: string;
+    };
+  }
   | undefined;
 
 function badgeTone(status: string) {
@@ -124,6 +156,47 @@ function badgeTone(status: string) {
     default:
       return "new";
   }
+}
+
+function normalizeVariantDisplayTitle(variant: any) {
+  const rawTitle = String(variant?.title || "");
+  if (rawTitle.trim().toLowerCase() === "default title") {
+    return "No variants";
+  }
+
+  const selectedOptions = Array.isArray(variant?.selectedOptions)
+    ? variant.selectedOptions
+    : [];
+
+  if (!selectedOptions.length) {
+    return rawTitle || "Untitled variant";
+  }
+
+  return selectedOptions.map((o: any) => o?.value).filter(Boolean).join(" / ");
+}
+
+function buildOptionGroups(variants: ComponentVariantItem[]): ComponentOptionGroup[] {
+  const realVariants = variants.filter(
+    (variant) => variant.title.trim().toLowerCase() !== "default title",
+  );
+
+  if (!realVariants.length) return [];
+
+  const map = new Map<string, Set<string>>();
+
+  for (const variant of realVariants) {
+    for (const option of variant.selectedOptions) {
+      if (!map.has(option.name)) {
+        map.set(option.name, new Set());
+      }
+      map.get(option.name)!.add(option.value);
+    }
+  }
+
+  return Array.from(map.entries()).map(([name, values]) => ({
+    name,
+    values: Array.from(values),
+  }));
 }
 
 /* --------------------------
@@ -171,7 +244,16 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     ...bundle.components.map((c) => c.productId),
   ].filter(Boolean);
 
-  const productsById: Record<string, { title: string; handle: string; status: string }> = {};
+  const productsById: Record<
+    string,
+    {
+      title: string;
+      handle: string;
+      status: string;
+      variants: ComponentVariantItem[];
+      optionGroups: ComponentOptionGroup[];
+    }
+  > = {};
 
   if (productIds.length) {
     const resp = await admin.graphql(PRODUCTS_BY_ID, { variables: { ids: productIds } });
@@ -179,10 +261,25 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
     for (const node of json?.data?.nodes ?? []) {
       if (node?.id) {
+        const variants: ComponentVariantItem[] =
+          node?.variants?.nodes?.map((variant: any) => ({
+            id: variant.id,
+            title: variant.title,
+            displayTitle: normalizeVariantDisplayTitle(variant),
+            selectedOptions: Array.isArray(variant.selectedOptions)
+              ? variant.selectedOptions.map((o: any) => ({
+                name: String(o?.name || ""),
+                value: String(o?.value || ""),
+              }))
+              : [],
+          })) ?? [];
+
         productsById[node.id] = {
           title: node.title,
           handle: node.handle,
           status: String(node.status ?? "UNKNOWN"),
+          variants,
+          optionGroups: buildOptionGroups(variants),
         };
       }
     }
@@ -203,6 +300,8 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       title: p?.title || c.productId,
       handle: p?.handle || "",
       status: String(p?.status || "UNKNOWN").toLowerCase(),
+      variants: p?.variants || [],
+      optionGroups: p?.optionGroups || [],
     };
   });
 
@@ -558,14 +657,56 @@ export default function BundleDetails() {
               <BlockStack gap="0">
                 {bundle.components.map((c) => (
                   <Box key={`${c.position}-${c.productId}`} padding="400">
-                    <InlineStack align="space-between" blockAlign="center">
-                      <BlockStack gap="100">
-                        <Text as="p" variant="bodyMd" fontWeight="semibold">
-                          {c.position}. {c.title}
-                        </Text>
-                        <Text as="p" tone="subdued">
-                          {c.handle ? `/products/${c.handle}` : c.productId} • {c.status}
-                        </Text>
+                    <InlineStack align="space-between" blockAlign="start">
+                      <BlockStack gap="200">
+                        <BlockStack gap="100">
+                          <Text as="p" variant="bodyMd" fontWeight="semibold">
+                            {c.position}. {c.title}
+                          </Text>
+                          <Text as="p" tone="subdued">
+                            {c.handle ? `/products/${c.handle}` : c.productId} • {c.status}
+                          </Text>
+                        </BlockStack>
+
+                        {c.optionGroups.length > 0 ? (
+                          <BlockStack gap="200">
+                            {c.optionGroups.map((group) => (
+                              <BlockStack key={group.name} gap="100">
+                                <Text as="p" tone="subdued">
+                                  {group.name}
+                                </Text>
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    flexWrap: "wrap",
+                                    gap: "8px",
+                                  }}
+                                >
+                                  {group.values.map((value) => (
+                                    <Badge key={`${group.name}-${value}`}>{value}</Badge>
+                                  ))}
+                                </div>
+                              </BlockStack>
+                            ))}
+                          </BlockStack>
+                        ) : c.variants.length > 0 ? (
+                          <BlockStack gap="100">
+                            <Text as="p" tone="subdued">
+                              Variants
+                            </Text>
+                            <div
+                              style={{
+                                display: "flex",
+                                flexWrap: "wrap",
+                                gap: "8px",
+                              }}
+                            >
+                              {c.variants.map((variant) => (
+                                <Badge key={variant.id}>{variant.displayTitle}</Badge>
+                              ))}
+                            </div>
+                          </BlockStack>
+                        ) : null}
                       </BlockStack>
 
                       <Button
