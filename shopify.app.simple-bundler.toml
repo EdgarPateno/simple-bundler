@@ -1,7 +1,7 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "8ff8d5b35bdc5999582d935be2aeb3b2"
-name = "simple bundler"
+name = "Simple Bundler"
 application_url = "https://example.com"
 embedded = true
 
