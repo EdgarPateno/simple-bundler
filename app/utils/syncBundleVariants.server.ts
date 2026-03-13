@@ -94,6 +94,9 @@ const PRODUCT_STATE = `#graphql
    Utilities
 -------------------------- */
 
+type DesiredOption = { name: string; values: string[] };
+type DesiredCombo = Array<{ optionName: string; value: string }>;
+
 function cartesian<T>(arrays: T[][]): T[][] {
   return arrays.reduce<T[][]>(
     (acc, curr) => acc.flatMap((a) => curr.map((b) => [...a, b])),
@@ -119,6 +122,109 @@ function optionsKeyFromSelectedOptions(selectedOptions: Array<{ name: string; va
     .map((o) => `${normalize(o.name)}=${normalize(o.value)}`)
     .sort()
     .join("|");
+}
+
+function desiredComboKey(combo: DesiredCombo) {
+  return combo
+    .map((o) => ({ name: o.optionName, value: o.value }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((o) => `${normalize(o.name)}=${normalize(o.value)}`)
+    .join("|");
+}
+
+function sameValueSet(a: string[], b: string[]) {
+  const aSet = new Set((a ?? []).map(normalize));
+  const bSet = new Set((b ?? []).map(normalize));
+  if (aSet.size !== bSet.size) return false;
+  for (const value of aSet) {
+    if (!bSet.has(value)) return false;
+  }
+  return true;
+}
+
+function getRealOptions(product: any) {
+  return (product?.options ?? []).filter((o: any) => normalize(o.name) !== "title");
+}
+
+function getRealVariants(product: any) {
+  return (product?.variants?.nodes ?? []).filter(
+    (v: any) => normalize(v.title) !== "default title",
+  );
+}
+
+function assessBundleStructure(
+  bundleProduct: any,
+  desiredOptions: DesiredOption[],
+  desiredCombos: DesiredCombo[],
+) {
+  const existingOptions = getRealOptions(bundleProduct);
+  const existingAllVariants = bundleProduct?.variants?.nodes ?? [];
+  const existingRealVariants = getRealVariants(bundleProduct);
+
+  // Desired result is a single default variant with no real options
+  if (!desiredOptions.length) {
+    const compatible =
+      existingOptions.length === 0 && existingAllVariants.length === 1;
+
+    return {
+      shouldRebuild: !compatible,
+      shouldEnsureVariants: false,
+    };
+  }
+
+  // Option structure must match exactly by name + allowed values
+  if (existingOptions.length !== desiredOptions.length) {
+    return {
+      shouldRebuild: true,
+      shouldEnsureVariants: false,
+    };
+  }
+
+  for (const desired of desiredOptions) {
+    const existing = existingOptions.find(
+      (o: any) => normalize(o.name) === normalize(desired.name),
+    );
+
+    if (!existing) {
+      return {
+        shouldRebuild: true,
+        shouldEnsureVariants: false,
+      };
+    }
+
+    const existingValues = (existing.optionValues ?? []).map((v: any) => String(v.name || ""));
+    if (!sameValueSet(existingValues, desired.values)) {
+      return {
+        shouldRebuild: true,
+        shouldEnsureVariants: false,
+      };
+    }
+  }
+
+  const existingKeys = new Set<string>(
+  existingRealVariants.map((v: any) =>
+    optionsKeyFromSelectedOptions(v.selectedOptions ?? []),
+  ),
+);
+const desiredKeys = new Set<string>(desiredCombos.map(desiredComboKey));
+
+  // Existing variants must not contain combos that are no longer desired.
+  // Missing desired variants are okay; we can create them without rebuilding.
+  for (const existingKey of existingKeys) {
+    if (!desiredKeys.has(existingKey)) {
+      return {
+        shouldRebuild: true,
+        shouldEnsureVariants: false,
+      };
+    }
+  }
+
+  const shouldEnsureVariants = desiredKeys.size > existingKeys.size;
+
+  return {
+    shouldRebuild: false,
+    shouldEnsureVariants,
+  };
 }
 
 async function fetchProductState(admin: any, productId: string) {
@@ -242,7 +348,7 @@ async function ensureVariantsExist({
 }: {
   admin: any;
   productId: string;
-  desiredCombos: Array<Array<{ optionName: string; value: string }>>;
+  desiredCombos: DesiredCombo[];
 }) {
   let product = await fetchProductState(admin, productId);
 
@@ -257,15 +363,7 @@ async function ensureVariantsExist({
   );
 
   const variantsToCreate = desiredCombos
-    .filter((combo) => {
-      const key = combo
-        .map((o) => ({ name: o.optionName, value: o.value }))
-        .sort((a, b) => a.name.localeCompare(b.name))
-        .map((o) => `${normalize(o.name)}=${normalize(o.value)}`)
-        .join("|");
-
-      return !existingKeys.has(key);
-    })
+    .filter((combo) => !existingKeys.has(desiredComboKey(combo)))
     .map((combo) => ({
       optionValues: combo.map((c) => {
         const optionId = optionIdByName.get(c.optionName);
@@ -347,8 +445,6 @@ export async function syncBundleVariants({
   const aDefaultOnly = isDefaultOnlyProduct(aVariants);
   const bDefaultOnly = isDefaultOnlyProduct(bVariants);
 
-  await resetBundleProduct(admin, bundleProductId);
-
   /* =========================================================
      SEPARATE MODE
      ========================================================= */
@@ -356,14 +452,14 @@ export async function syncBundleVariants({
     const aPrefix = optionPrefix(productA.title);
     const bPrefix = optionPrefix(productB.title);
 
-    const aOpts: Array<{ name: string; values: string[] }> = aDefaultOnly
+    const aOpts: DesiredOption[] = aDefaultOnly
       ? []
       : (productA.options ?? []).map((o: any) => ({
           name: `${aPrefix}${o.name}`,
           values: (o.optionValues ?? []).map((v: any) => v.name),
         }));
 
-    const bOpts: Array<{ name: string; values: string[] }> = bDefaultOnly
+    const bOpts: DesiredOption[] = bDefaultOnly
       ? []
       : (productB.options ?? []).map((o: any) => ({
           name: `${bPrefix}${o.name}`,
@@ -373,7 +469,11 @@ export async function syncBundleVariants({
     const desiredOptions = [...aOpts, ...bOpts].filter((o) => o.values?.length);
 
     if (!desiredOptions.length) {
-      const cleanBundle = await fetchProductState(admin, bundleProductId);
+      const structure = assessBundleStructure(bundle, [], []);
+      const cleanBundle = structure.shouldRebuild
+        ? await resetBundleProduct(admin, bundleProductId)
+        : await fetchProductState(admin, bundleProductId);
+
       const bundleVariant = cleanBundle?.variants?.nodes?.[0];
       if (!bundleVariant?.id) throw new Error("Bundle product has no variant to map.");
 
@@ -386,16 +486,7 @@ export async function syncBundleVariants({
       return;
     }
 
-    await createOptions(
-      admin,
-      bundleProductId,
-      desiredOptions.map((o) => ({
-        name: o.name,
-        values: o.values.map((v) => ({ name: v })),
-      })),
-    );
-
-    const combos = cartesian(
+    const combos: DesiredCombo[] = cartesian(
       desiredOptions.map((o) =>
         o.values.map((value) => ({ optionName: o.name, value })),
       ),
@@ -407,11 +498,28 @@ export async function syncBundleVariants({
       );
     }
 
-    await ensureVariantsExist({
-      admin,
-      productId: bundleProductId,
-      desiredCombos: combos,
-    });
+    const structure = assessBundleStructure(bundle, desiredOptions, combos);
+
+    if (structure.shouldRebuild) {
+      await resetBundleProduct(admin, bundleProductId);
+
+      await createOptions(
+        admin,
+        bundleProductId,
+        desiredOptions.map((o) => ({
+          name: o.name,
+          values: o.values.map((v) => ({ name: v })),
+        })),
+      );
+    }
+
+    if (structure.shouldRebuild || structure.shouldEnsureVariants) {
+      await ensureVariantsExist({
+        admin,
+        productId: bundleProductId,
+        desiredCombos: combos,
+      });
+    }
 
     const finalBundle = await removeDefaultVariantIfNeeded(admin, bundleProductId);
     const finalVariants = finalBundle?.variants?.nodes ?? [];
@@ -455,7 +563,11 @@ export async function syncBundleVariants({
      ========================================================= */
 
   if (aDefaultOnly && bDefaultOnly) {
-    const cleanBundle = await fetchProductState(admin, bundleProductId);
+    const structure = assessBundleStructure(bundle, [], []);
+    const cleanBundle = structure.shouldRebuild
+      ? await resetBundleProduct(admin, bundleProductId)
+      : await fetchProductState(admin, bundleProductId);
+
     const bundleVariant = cleanBundle?.variants?.nodes?.[0];
     if (!bundleVariant?.id) throw new Error("Bundle product has no variant to map.");
 
@@ -483,22 +595,37 @@ export async function syncBundleVariants({
       throw new Error("No variant option found on the variant product.");
     }
 
-    await createOptions(admin, bundleProductId, [
+    const desiredOptions: DesiredOption[] = [
       {
         name: bundleOptionName,
-        values: optionValues.map((v: string) => ({ name: v })),
+        values: optionValues,
       },
-    ]);
+    ];
 
-    const combos = optionValues.map((value: string) => [
+    const combos: DesiredCombo[] = optionValues.map((value: string) => [
       { optionName: bundleOptionName, value },
     ]);
 
-    await ensureVariantsExist({
-      admin,
-      productId: bundleProductId,
-      desiredCombos: combos,
-    });
+    const structure = assessBundleStructure(bundle, desiredOptions, combos);
+
+    if (structure.shouldRebuild) {
+      await resetBundleProduct(admin, bundleProductId);
+
+      await createOptions(admin, bundleProductId, [
+        {
+          name: bundleOptionName,
+          values: optionValues.map((v: string) => ({ name: v })),
+        },
+      ]);
+    }
+
+    if (structure.shouldRebuild || structure.shouldEnsureVariants) {
+      await ensureVariantsExist({
+        admin,
+        productId: bundleProductId,
+        desiredCombos: combos,
+      });
+    }
 
     const finalBundle = await removeDefaultVariantIfNeeded(admin, bundleProductId);
     const finalVariants = finalBundle?.variants?.nodes ?? [];
@@ -540,22 +667,37 @@ export async function syncBundleVariants({
     throw new Error("No shared variant option found.");
   }
 
-  await createOptions(admin, bundleProductId, [
+  const desiredOptions: DesiredOption[] = [
     {
       name: bundleOptionName,
-      values: sharedValues.map((v: string) => ({ name: v })),
+      values: sharedValues,
     },
-  ]);
+  ];
 
-  const combos = sharedValues.map((value: string) => [
+  const combos: DesiredCombo[] = sharedValues.map((value: string) => [
     { optionName: bundleOptionName, value },
   ]);
 
-  await ensureVariantsExist({
-    admin,
-    productId: bundleProductId,
-    desiredCombos: combos,
-  });
+  const structure = assessBundleStructure(bundle, desiredOptions, combos);
+
+  if (structure.shouldRebuild) {
+    await resetBundleProduct(admin, bundleProductId);
+
+    await createOptions(admin, bundleProductId, [
+      {
+        name: bundleOptionName,
+        values: sharedValues.map((v: string) => ({ name: v })),
+      },
+    ]);
+  }
+
+  if (structure.shouldRebuild || structure.shouldEnsureVariants) {
+    await ensureVariantsExist({
+      admin,
+      productId: bundleProductId,
+      desiredCombos: combos,
+    });
+  }
 
   const finalBundle = await removeDefaultVariantIfNeeded(admin, bundleProductId);
   const finalVariants = finalBundle?.variants?.nodes ?? [];
