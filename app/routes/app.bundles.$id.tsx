@@ -635,11 +635,6 @@ export default function BundleDetails() {
                         Save changes
                       </Button>
                     </InlineStack>
-
-                    <Text as="p" tone="subdued">
-                      Safe edit: this updates the bundle product title, variant mode, bundle includes text, and component products,
-                      but keeps the bundle URL/handle unchanged. If you want to change the URL/handle, please update the parent product in Shopify directly and then click "Sync components" to pull in changes.
-                    </Text>
                   </BlockStack>
                 </Form>
               </Box>
